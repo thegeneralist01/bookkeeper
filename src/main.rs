@@ -17,6 +17,8 @@ use uuid::Uuid;
 const ACK_TTL_SECS: u64 = 5;
 const UNDO_TTL_SECS: u64 = 30 * 60;
 const DELETE_CONFIRM_TTL_SECS: u64 = 5 * 60;
+const RESOURCE_PROMPT_TTL_SECS: u64 = 5 * 60;
+const PAGE_SIZE: usize = 3;
 
 #[derive(Debug, Deserialize, Clone)]
 struct Config {
@@ -24,6 +26,7 @@ struct Config {
     user_id: u64,
     read_later_path: PathBuf,
     finished_path: PathBuf,
+    resources_path: PathBuf,
     data_dir: PathBuf,
     retry_interval_seconds: Option<u64>,
 }
@@ -104,11 +107,14 @@ impl EntryBlock {
 struct QueuedOp {
     kind: QueuedOpKind,
     entry: String,
+    #[serde(default)]
+    resource_path: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 enum QueuedOpKind {
     Add,
+    AddResource,
     Delete,
     MoveToFinished,
     MoveToReadLater,
@@ -135,11 +141,44 @@ struct PickerState {
     message_id: MessageId,
     items: Vec<String>,
     selected: Vec<bool>,
+    source_message_id: MessageId,
+}
+
+#[derive(Clone, Debug)]
+struct AddPrompt {
+    chat_id: i64,
+    message_id: MessageId,
+    text: String,
+    source_message_id: MessageId,
+}
+
+#[derive(Clone, Debug)]
+struct ResourcePickerState {
+    chat_id: i64,
+    message_id: MessageId,
+    text: String,
+    source_message_id: Option<MessageId>,
+    files: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct ResourceFilenamePrompt {
+    text: String,
+    source_message_id: Option<MessageId>,
+    prompt_message_id: MessageId,
+    expires_at: u64,
+}
+
+#[derive(Clone, Debug)]
+enum SessionKind {
+    List,
+    Search { query: String },
 }
 
 #[derive(Clone, Debug)]
 struct ListSession {
     id: String,
+    kind: SessionKind,
     entries: Vec<EntryBlock>,
     view: ListView,
     seen_random: HashSet<usize>,
@@ -169,6 +208,9 @@ struct AppState {
     write_lock: Mutex<()>,
     sessions: Mutex<HashMap<i64, ListSession>>,
     pickers: Mutex<HashMap<String, PickerState>>,
+    add_prompts: Mutex<HashMap<String, AddPrompt>>,
+    resource_pickers: Mutex<HashMap<String, ResourcePickerState>>,
+    resource_filename_prompts: Mutex<HashMap<i64, ResourceFilenamePrompt>>,
     queue: Mutex<Vec<QueuedOp>>,
     undo: Mutex<Vec<UndoRecord>>,
     queue_path: PathBuf,
@@ -207,6 +249,9 @@ async fn main() -> Result<()> {
         write_lock: Mutex::new(()),
         sessions: Mutex::new(HashMap::new()),
         pickers: Mutex::new(HashMap::new()),
+        add_prompts: Mutex::new(HashMap::new()),
+        resource_pickers: Mutex::new(HashMap::new()),
+        resource_filename_prompts: Mutex::new(HashMap::new()),
         queue: Mutex::new(load_queue(&queue_path)?),
         undo: Mutex::new(undo),
         queue_path,
@@ -249,19 +294,66 @@ async fn handle_message(
     }
 
     let text = match msg.text() {
-        Some(text) => text,
+        Some(text) => text.to_string(),
         None => return Ok(()),
     };
 
-    if let Some(cmd) = parse_command(text) {
+    let mut expired_prompt: Option<ResourceFilenamePrompt> = None;
+    let pending_prompt = {
+        let mut prompts = state.resource_filename_prompts.lock().await;
+        if let Some(prompt) = prompts.remove(&msg.chat.id.0) {
+            if prompt.expires_at > now_ts() {
+                Some(prompt)
+            } else {
+                expired_prompt = Some(prompt);
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    if let Some(prompt) = expired_prompt {
+        let _ = bot
+            .delete_message(msg.chat.id, prompt.prompt_message_id)
+            .await;
+    }
+
+    if let Some(prompt) = pending_prompt {
+        handle_resource_filename_response(&bot, msg.chat.id, &state, &text, prompt).await?;
+        return Ok(());
+    }
+
+    if let Some(cmd) = parse_command(&text) {
+        let rest = text
+            .splitn(2, |c: char| c.is_whitespace())
+            .nth(1)
+            .unwrap_or("")
+            .trim();
         match cmd {
             "start" | "help" => {
-                let help = "Send any text to save it. Use /list to browse. Use --- to split a message into multiple items.";
+                let help = "Send any text to save it. Use /add <text> to choose reading list or resources. Use /list to browse. Use /delete <query> to remove an item. Use --- to split a message into multiple items.";
                 bot.send_message(msg.chat.id, help).await?;
+                return Ok(());
+            }
+            "add" => {
+                if rest.is_empty() {
+                    send_error(&bot, msg.chat.id, "Provide text to add.").await?;
+                } else {
+                    handle_add_command(bot, msg, state, rest).await?;
+                }
                 return Ok(());
             }
             "list" => {
                 handle_list_command(bot, msg, state).await?;
+                return Ok(());
+            }
+            "delete" => {
+                if rest.is_empty() {
+                    send_error(&bot, msg.chat.id, "Provide a search query.").await?;
+                } else {
+                    handle_delete_command(bot, msg, state, rest).await?;
+                }
                 return Ok(());
             }
             _ => {
@@ -271,9 +363,9 @@ async fn handle_message(
     }
 
     if text.contains("---") {
-        handle_multi_item(bot, msg.chat.id, state, text).await?;
+        handle_multi_item(bot, msg.chat.id, msg.id, state, &text).await?;
     } else {
-        handle_single_item(bot, msg.chat.id, state, text).await?;
+        handle_single_item(bot, msg.chat.id, state, &text, Some(msg.id)).await?;
     }
 
     Ok(())
@@ -294,6 +386,10 @@ async fn handle_callback(
             handle_list_callback(bot, q, state).await?;
         } else if data.starts_with("pick:") {
             handle_picker_callback(bot, q, state).await?;
+        } else if data.starts_with("add:") {
+            handle_add_callback(bot, q, state).await?;
+        } else if data.starts_with("res:") {
+            handle_resource_callback(bot, q, state).await?;
         } else if data.starts_with("undo:") {
             handle_undo_callback(bot, q, state).await?;
         }
@@ -308,10 +404,10 @@ async fn handle_list_command(
     state: std::sync::Arc<AppState>,
 ) -> Result<()> {
     let entries = read_entries(&state.config.read_later_path)?.1;
-    let count = entries.len();
     let session_id = short_id();
     let session = ListSession {
         id: session_id.clone(),
+        kind: SessionKind::List,
         entries,
         view: ListView::Menu,
         seen_random: HashSet::new(),
@@ -320,9 +416,50 @@ async fn handle_list_command(
         .sessions
         .lock()
         .await
-        .insert(msg.chat.id.0, session);
+        .insert(msg.chat.id.0, session.clone());
 
-    let (text, kb) = build_menu_view(&session_id, count);
+    let (text, kb) = build_menu_view(&session_id, &session);
+    bot.send_message(msg.chat.id, text)
+        .reply_markup(kb)
+        .await?;
+    Ok(())
+}
+
+async fn handle_delete_command(
+    bot: Bot,
+    msg: Message,
+    state: std::sync::Arc<AppState>,
+    query: &str,
+) -> Result<()> {
+    let entries = read_entries(&state.config.read_later_path)?.1;
+    let matches = search_entries(&entries, query);
+
+    if matches.is_empty() {
+        send_ephemeral(&bot, msg.chat.id, "No matches.", ACK_TTL_SECS).await?;
+        return Ok(());
+    }
+
+    let session_id = short_id();
+    let session = ListSession {
+        id: session_id.clone(),
+        kind: SessionKind::Search {
+            query: query.to_string(),
+        },
+        entries: matches,
+        view: ListView::Peek {
+            mode: ListMode::Top,
+            page: 0,
+        },
+        seen_random: HashSet::new(),
+    };
+
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(msg.chat.id.0, session.clone());
+
+    let (text, kb) = render_list_view(&session_id, &session);
     bot.send_message(msg.chat.id, text)
         .reply_markup(kb)
         .await?;
@@ -334,19 +471,27 @@ async fn handle_single_item(
     chat_id: ChatId,
     state: std::sync::Arc<AppState>,
     text: &str,
+    source_message_id: Option<MessageId>,
 ) -> Result<()> {
     let entry = EntryBlock::from_text(text);
     let op = QueuedOp {
         kind: QueuedOpKind::Add,
         entry: entry.block_string(),
+        resource_path: None,
     };
 
     match apply_user_op(&state, &op).await? {
         UserOpOutcome::Applied(ApplyOutcome::Applied) => {
             send_ephemeral(&bot, chat_id, "Saved.", ACK_TTL_SECS).await?;
+            if let Some(message_id) = source_message_id {
+                let _ = bot.delete_message(chat_id, message_id).await;
+            }
         }
         UserOpOutcome::Applied(ApplyOutcome::Duplicate) => {
             send_ephemeral(&bot, chat_id, "Already saved.", ACK_TTL_SECS).await?;
+            if let Some(message_id) = source_message_id {
+                let _ = bot.delete_message(chat_id, message_id).await;
+            }
         }
         UserOpOutcome::Applied(ApplyOutcome::NotFound) => {
             // Not used for add.
@@ -362,6 +507,7 @@ async fn handle_single_item(
 async fn handle_multi_item(
     bot: Bot,
     chat_id: ChatId,
+    source_message_id: MessageId,
     state: std::sync::Arc<AppState>,
     text: &str,
 ) -> Result<()> {
@@ -383,8 +529,316 @@ async fn handle_multi_item(
         message_id: sent.id,
         items,
         selected,
+        source_message_id,
     };
     state.pickers.lock().await.insert(picker_id, picker);
+    Ok(())
+}
+
+async fn handle_add_command(
+    bot: Bot,
+    msg: Message,
+    state: std::sync::Arc<AppState>,
+    text: &str,
+) -> Result<()> {
+    let prompt_id = short_id();
+    let kb = build_add_prompt_keyboard(&prompt_id);
+    let prompt_text = "Add to reading list or resources?";
+    let sent = bot.send_message(msg.chat.id, prompt_text).reply_markup(kb).await?;
+
+    let prompt = AddPrompt {
+        chat_id: msg.chat.id.0,
+        message_id: sent.id,
+        text: text.to_string(),
+        source_message_id: msg.id,
+    };
+    state.add_prompts.lock().await.insert(prompt_id, prompt);
+    Ok(())
+}
+
+async fn handle_add_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    state: std::sync::Arc<AppState>,
+) -> Result<()> {
+    let Some(message) = q.message.clone() else {
+        return Ok(());
+    };
+    let Some(data) = q.data.as_deref() else {
+        return Ok(());
+    };
+    let mut parts = data.split(':');
+    let _ = parts.next();
+    let prompt_id = match parts.next() {
+        Some(id) => id.to_string(),
+        None => return Ok(()),
+    };
+    let action = match parts.next() {
+        Some(action) => action,
+        None => return Ok(()),
+    };
+
+    let prompt = {
+        let mut prompts = state.add_prompts.lock().await;
+        let prompt = match prompts.remove(&prompt_id) {
+            Some(prompt) => prompt,
+            None => {
+                bot.answer_callback_query(q.id).await?;
+                return Ok(());
+            }
+        };
+        if prompt.chat_id != message.chat.id.0 || prompt.message_id != message.id {
+            prompts.insert(prompt_id.clone(), prompt);
+            bot.answer_callback_query(q.id).await?;
+            return Ok(());
+        }
+        prompt
+    };
+
+    match action {
+        "normal" => {
+            handle_single_item(
+                bot.clone(),
+                message.chat.id,
+                state.clone(),
+                &prompt.text,
+                Some(prompt.source_message_id),
+            )
+            .await?;
+        }
+        "resource" => {
+            start_resource_picker(
+                &bot,
+                message.chat.id,
+                &state,
+                &prompt.text,
+                Some(prompt.source_message_id),
+            )
+            .await?;
+        }
+        "cancel" => {}
+        _ => {
+            let mut prompts = state.add_prompts.lock().await;
+            prompts.insert(prompt_id, prompt);
+            bot.answer_callback_query(q.id).await?;
+            return Ok(());
+        }
+    }
+
+    let _ = bot.delete_message(message.chat.id, message.id).await;
+    bot.answer_callback_query(q.id).await?;
+    Ok(())
+}
+
+async fn start_resource_picker(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &std::sync::Arc<AppState>,
+    text: &str,
+    source_message_id: Option<MessageId>,
+) -> Result<()> {
+    let files = list_resource_files(&state.config.resources_path)?;
+    let picker_id = short_id();
+    let kb = build_resource_picker_keyboard(&picker_id, &files);
+    let prompt_text = if files.is_empty() {
+        "No resource files found. Create a new one?"
+    } else {
+        "Choose a resource file:"
+    };
+    let sent = bot.send_message(chat_id, prompt_text).reply_markup(kb).await?;
+
+    let picker = ResourcePickerState {
+        chat_id: chat_id.0,
+        message_id: sent.id,
+        text: text.to_string(),
+        source_message_id,
+        files,
+    };
+    state
+        .resource_pickers
+        .lock()
+        .await
+        .insert(picker_id, picker);
+    Ok(())
+}
+
+async fn handle_resource_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    state: std::sync::Arc<AppState>,
+) -> Result<()> {
+    let Some(message) = q.message.clone() else {
+        return Ok(());
+    };
+    let Some(data) = q.data.as_deref() else {
+        return Ok(());
+    };
+    let mut parts = data.split(':');
+    let _ = parts.next();
+    let picker_id = match parts.next() {
+        Some(id) => id.to_string(),
+        None => return Ok(()),
+    };
+    let action = match parts.next() {
+        Some(action) => action,
+        None => return Ok(()),
+    };
+
+    let picker = {
+        let mut pickers = state.resource_pickers.lock().await;
+        let picker = match pickers.remove(&picker_id) {
+            Some(picker) => picker,
+            None => {
+                bot.answer_callback_query(q.id).await?;
+                return Ok(());
+            }
+        };
+        if picker.chat_id != message.chat.id.0 || picker.message_id != message.id {
+            pickers.insert(picker_id.clone(), picker);
+            bot.answer_callback_query(q.id).await?;
+            return Ok(());
+        }
+        picker
+    };
+
+    let mut reinsert = false;
+    match action {
+        "file" => {
+            let index = parts.next().and_then(|p| p.parse::<usize>().ok());
+            if let Some(index) = index {
+                if let Some(path) = picker.files.get(index).cloned() {
+                    add_resource_from_text(
+                        &bot,
+                        message.chat.id,
+                        &state,
+                        path,
+                        &picker.text,
+                        picker.source_message_id.clone(),
+                    )
+                    .await?;
+                    let _ = bot.delete_message(message.chat.id, message.id).await;
+                } else {
+                    reinsert = true;
+                }
+            } else {
+                reinsert = true;
+            }
+        }
+        "new" => {
+            let prompt_text = "Send the new resource filename (example: Resources.md).";
+            let sent = bot.send_message(message.chat.id, prompt_text).await?;
+            let prompt = ResourceFilenamePrompt {
+                text: picker.text.clone(),
+                source_message_id: picker.source_message_id.clone(),
+                prompt_message_id: sent.id,
+                expires_at: now_ts() + RESOURCE_PROMPT_TTL_SECS,
+            };
+            let previous = state
+                .resource_filename_prompts
+                .lock()
+                .await
+                .insert(message.chat.id.0, prompt);
+            if let Some(previous) = previous {
+                let _ = bot
+                    .delete_message(message.chat.id, previous.prompt_message_id)
+                    .await;
+            }
+            let _ = bot.delete_message(message.chat.id, message.id).await;
+        }
+        "cancel" => {
+            let _ = bot.delete_message(message.chat.id, message.id).await;
+        }
+        _ => {
+            reinsert = true;
+        }
+    }
+
+    if reinsert {
+        state
+            .resource_pickers
+            .lock()
+            .await
+            .insert(picker_id, picker);
+    }
+
+    bot.answer_callback_query(q.id).await?;
+    Ok(())
+}
+
+async fn add_resource_from_text(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &std::sync::Arc<AppState>,
+    resource_path: PathBuf,
+    text: &str,
+    source_message_id: Option<MessageId>,
+) -> Result<()> {
+    let entry_block = resource_block_from_text(text);
+    let op = QueuedOp {
+        kind: QueuedOpKind::AddResource,
+        entry: entry_block,
+        resource_path: Some(resource_path),
+    };
+
+    match apply_user_op(state, &op).await? {
+        UserOpOutcome::Applied(ApplyOutcome::Applied) => {
+            send_ephemeral(bot, chat_id, "Added to resources.", ACK_TTL_SECS).await?;
+            if let Some(message_id) = source_message_id {
+                let _ = bot.delete_message(chat_id, message_id).await;
+            }
+        }
+        UserOpOutcome::Applied(ApplyOutcome::Duplicate) => {
+            send_ephemeral(bot, chat_id, "Already in resources.", ACK_TTL_SECS).await?;
+            if let Some(message_id) = source_message_id {
+                let _ = bot.delete_message(chat_id, message_id).await;
+            }
+        }
+        UserOpOutcome::Applied(ApplyOutcome::NotFound) => {}
+        UserOpOutcome::Queued => {
+            send_error(bot, chat_id, "Write failed; queued for retry.").await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_resource_filename_response(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &std::sync::Arc<AppState>,
+    text: &str,
+    prompt: ResourceFilenamePrompt,
+) -> Result<()> {
+    let filename = match sanitize_resource_filename(text) {
+        Ok(name) => name,
+        Err(err) => {
+            send_error(bot, chat_id, &err.to_string()).await?;
+            let mut prompts = state.resource_filename_prompts.lock().await;
+            prompts.insert(
+                chat_id.0,
+                ResourceFilenamePrompt {
+                    expires_at: now_ts() + RESOURCE_PROMPT_TTL_SECS,
+                    ..prompt
+                },
+            );
+            return Ok(());
+        }
+    };
+
+    let resource_path = state.config.resources_path.join(filename);
+    add_resource_from_text(
+        bot,
+        chat_id,
+        state,
+        resource_path,
+        &prompt.text,
+        prompt.source_message_id.clone(),
+    )
+    .await?;
+
+    let _ = bot
+        .delete_message(chat_id, prompt.prompt_message_id)
+        .await;
     Ok(())
 }
 
@@ -430,7 +884,9 @@ async fn handle_list_callback(
 
     match action {
         "menu" => {
-            session.view = ListView::Menu;
+            if matches!(&session.kind, SessionKind::List) {
+                session.view = ListView::Menu;
+            }
         }
         "top" => {
             let page = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
@@ -469,23 +925,36 @@ async fn handle_list_callback(
                 other => other,
             };
         }
+        "close" => {
+            if matches!(&session.kind, SessionKind::Search { .. }) {
+                bot.delete_message(message.chat.id, message.id).await?;
+                bot.answer_callback_query(q.id).await?;
+                return Ok(());
+            }
+        }
         "random" => {
-            if session.entries.is_empty() {
-                // Stay in place.
-            } else if session.seen_random.len() >= session.entries.len() {
-                // No unseen items left.
-                send_error(&bot, message.chat.id, "All items have been shown in this session.")
+            if matches!(&session.kind, SessionKind::List) {
+                if session.entries.is_empty() {
+                    // Stay in place.
+                } else if session.seen_random.len() >= session.entries.len() {
+                    // No unseen items left.
+                    send_error(
+                        &bot,
+                        message.chat.id,
+                        "All items have been shown in this session.",
+                    )
                     .await?;
-            } else {
-                let mut remaining: Vec<usize> = (0..session.entries.len())
-                    .filter(|i| !session.seen_random.contains(i))
-                    .collect();
-                let mut rng = rand::thread_rng();
-                remaining.shuffle(&mut rng);
-                if let Some(index) = remaining.first().copied() {
-                    session.seen_random.insert(index);
-                    let return_to = Box::new(session.view.clone());
-                    session.view = ListView::Selected { return_to, index };
+                } else {
+                    let mut remaining: Vec<usize> = (0..session.entries.len())
+                        .filter(|i| !session.seen_random.contains(i))
+                        .collect();
+                    let mut rng = rand::thread_rng();
+                    remaining.shuffle(&mut rng);
+                    if let Some(index) = remaining.first().copied() {
+                        session.seen_random.insert(index);
+                        let return_to = Box::new(session.view.clone());
+                        session.view = ListView::Selected { return_to, index };
+                    }
                 }
             }
         }
@@ -513,6 +982,7 @@ async fn handle_list_callback(
                     let op = QueuedOp {
                         kind: QueuedOpKind::MoveToFinished,
                         entry: entry_block.clone(),
+                        resource_path: None,
                     };
                     match apply_user_op(&state, &op).await? {
                         UserOpOutcome::Applied(ApplyOutcome::Applied) => {
@@ -534,6 +1004,16 @@ async fn handle_list_callback(
                                 .await?;
                         }
                     }
+                }
+            }
+        }
+        "resource" => {
+            if let ListView::Selected { index, .. } = session.view.clone() {
+                if let Some(entry) = session.entries.get(index) {
+                    let text = entry.display_lines().join("\n");
+                    start_resource_picker(&bot, message.chat.id, &state, &text, None).await?;
+                } else {
+                    send_error(&bot, message.chat.id, "Item not found.").await?;
                 }
             }
         }
@@ -588,6 +1068,7 @@ async fn handle_list_callback(
                         let op = QueuedOp {
                             kind: QueuedOpKind::Delete,
                             entry: entry_block.clone(),
+                            resource_path: None,
                         };
                         match apply_user_op(&state, &op).await? {
                             UserOpOutcome::Applied(ApplyOutcome::Applied) => {
@@ -598,8 +1079,6 @@ async fn handle_list_callback(
                                     session.view = ListView::Menu;
                                 }
                                 normalize_peek_view(&mut session);
-                                send_ephemeral(&bot, message.chat.id, "Deleted.", ACK_TTL_SECS)
-                                    .await?;
                                 let undo_id = add_undo(&state, UndoKind::Delete, entry_block)
                                     .await?;
                                 send_undo_message(&bot, message.chat.id, &undo_id).await?;
@@ -717,6 +1196,7 @@ async fn handle_picker_callback(
                 let op = QueuedOp {
                     kind: QueuedOpKind::Add,
                     entry: entry.block_string(),
+                    resource_path: None,
                 };
                 match apply_user_op(&state, &op).await? {
                     UserOpOutcome::Applied(ApplyOutcome::Applied) => added += 1,
@@ -737,6 +1217,11 @@ async fn handle_picker_callback(
                 format!("Saved {} item(s).", added)
             };
             send_ephemeral(&bot, message.chat.id, &summary, ACK_TTL_SECS).await?;
+            if !queued {
+                let _ = bot
+                    .delete_message(ChatId(picker.chat_id), picker.source_message_id)
+                    .await;
+            }
             bot.delete_message(message.chat.id, message.id).await?;
         }
         "cancel" => {
@@ -761,7 +1246,9 @@ async fn handle_undo_callback(
     let Some(data) = q.data.as_deref() else {
         return Ok(());
     };
-    let undo_id = data.trim_start_matches("undo:");
+    let mut parts = data.trim_start_matches("undo:").split(':');
+    let undo_id = parts.next().unwrap_or("");
+    let action = parts.next().unwrap_or("undo");
 
     let (record, undo_snapshot) = {
         let mut undo = state.undo.lock().await;
@@ -776,6 +1263,14 @@ async fn handle_undo_callback(
     };
     save_undo(&state.undo_path, &undo_snapshot)?;
 
+    if action == "delete" {
+        if let Some(message) = q.message.clone() {
+            bot.delete_message(message.chat.id, message.id).await?;
+        }
+        bot.answer_callback_query(q.id).await?;
+        return Ok(());
+    }
+
     if let Some(record) = record {
         let chat_id = chat_id_from_user_id(q.from.id.0);
         if record.expires_at < now_ts() {
@@ -788,10 +1283,12 @@ async fn handle_undo_callback(
             UndoKind::MoveToFinished => QueuedOp {
                 kind: QueuedOpKind::MoveToReadLater,
                 entry: record.entry,
+                resource_path: None,
             },
             UndoKind::Delete => QueuedOp {
                 kind: QueuedOpKind::Add,
                 entry: record.entry,
+                resource_path: None,
             },
         };
 
@@ -831,6 +1328,17 @@ async fn apply_op(state: &std::sync::Arc<AppState>, op: &QueuedOp) -> Result<App
             let entry = EntryBlock::from_block(&op.entry);
             let outcome = with_retries(|| add_entry_sync(&state.config.read_later_path, &entry))
                 .await?;
+            Ok(match outcome {
+                AddOutcome::Added => ApplyOutcome::Applied,
+                AddOutcome::Duplicate => ApplyOutcome::Duplicate,
+            })
+        }
+        QueuedOpKind::AddResource => {
+            let path = op
+                .resource_path
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing resource path"))?;
+            let outcome = with_retries(|| add_resource_entry_sync(path, &op.entry)).await?;
             Ok(match outcome {
                 AddOutcome::Added => ApplyOutcome::Applied,
                 AddOutcome::Duplicate => ApplyOutcome::Duplicate,
@@ -903,6 +1411,25 @@ fn split_items(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn search_entries(entries: &[EntryBlock], query: &str) -> Vec<EntryBlock> {
+    entries
+        .iter()
+        .filter(|entry| matches_query(entry, query))
+        .cloned()
+        .collect()
+}
+
+fn matches_query(entry: &EntryBlock, query: &str) -> bool {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    let haystack = entry.display_lines().join("\n").to_lowercase();
+    needle
+        .split_whitespace()
+        .all(|term| haystack.contains(term))
+}
+
 fn build_picker_text(items: &[String], selected: &[bool]) -> String {
     let mut text = String::from("Select items to save:\n\n");
     for (idx, item) in items.iter().enumerate() {
@@ -945,9 +1472,59 @@ fn build_picker_keyboard(picker_id: &str, selected: &[bool]) -> InlineKeyboardMa
     InlineKeyboardMarkup::new(rows)
 }
 
+fn build_add_prompt_keyboard(prompt_id: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback(
+                "Reading list",
+                format!("add:{}:normal", prompt_id),
+            ),
+            InlineKeyboardButton::callback("Resource", format!("add:{}:resource", prompt_id)),
+        ],
+        vec![InlineKeyboardButton::callback(
+            "Cancel",
+            format!("add:{}:cancel", prompt_id),
+        )],
+    ])
+}
+
+fn build_resource_picker_keyboard(
+    picker_id: &str,
+    files: &[PathBuf],
+) -> InlineKeyboardMarkup {
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = Vec::new();
+    let mut current_row = Vec::new();
+    for (idx, path) in files.iter().enumerate() {
+        let label = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+        current_row.push(InlineKeyboardButton::callback(
+            label,
+            format!("res:{}:file:{}", picker_id, idx),
+        ));
+        if current_row.len() == 2 {
+            rows.push(std::mem::take(&mut current_row));
+        }
+    }
+    if !current_row.is_empty() {
+        rows.push(current_row);
+    }
+    rows.push(vec![InlineKeyboardButton::callback(
+        "New file",
+        format!("res:{}:new", picker_id),
+    )]);
+    rows.push(vec![InlineKeyboardButton::callback(
+        "Cancel",
+        format!("res:{}:cancel", picker_id),
+    )]);
+    InlineKeyboardMarkup::new(rows)
+}
+
 fn render_list_view(session_id: &str, session: &ListSession) -> (String, InlineKeyboardMarkup) {
     match &session.view {
-        ListView::Menu => build_menu_view(session_id, session.entries.len()),
+        ListView::Menu => build_menu_view(session_id, session),
         ListView::Peek { mode, page } => build_peek_view(session_id, session, *mode, *page),
         ListView::Selected { index, .. } => build_selected_view(session_id, session, *index),
         ListView::DeleteConfirm { step, index, .. } => {
@@ -956,32 +1533,58 @@ fn render_list_view(session_id: &str, session: &ListSession) -> (String, InlineK
     }
 }
 
-fn build_menu_view(session_id: &str, count: usize) -> (String, InlineKeyboardMarkup) {
-    let text = if count == 0 {
-        "Read Later is empty.".to_string()
-    } else {
-        "Choose Top, Bottom, or Random.".to_string()
-    };
+fn build_menu_view(session_id: &str, session: &ListSession) -> (String, InlineKeyboardMarkup) {
+    let count = session.entries.len();
+    match &session.kind {
+        SessionKind::List => {
+            let text = if count == 0 {
+                "Read Later is empty.".to_string()
+            } else {
+                "Choose Top, Bottom, or Random.".to_string()
+            };
 
-    let mut rows = Vec::new();
-    if count > 0 {
-        rows.push(vec![
-            InlineKeyboardButton::callback(
-                format!("Top ({})", count),
-                format!("ls:{}:top:0", session_id),
-            ),
-            InlineKeyboardButton::callback(
-                format!("Bottom ({})", count),
-                format!("ls:{}:bottom:0", session_id),
-            ),
-        ]);
-        rows.push(vec![InlineKeyboardButton::callback(
-            "Random",
-            format!("ls:{}:random", session_id),
-        )]);
+            let mut rows = Vec::new();
+            if count > 0 {
+                rows.push(vec![
+                    InlineKeyboardButton::callback(
+                        format!("Top ({})", count),
+                        format!("ls:{}:top:0", session_id),
+                    ),
+                    InlineKeyboardButton::callback(
+                        format!("Bottom ({})", count),
+                        format!("ls:{}:bottom:0", session_id),
+                    ),
+                ]);
+                rows.push(vec![InlineKeyboardButton::callback(
+                    "Random",
+                    format!("ls:{}:random", session_id),
+                )]);
+            }
+
+            (text, InlineKeyboardMarkup::new(rows))
+        }
+        SessionKind::Search { query } => {
+            let text = if count == 0 {
+                format!("No matches for \"{}\".", query)
+            } else {
+                format!("Matches for \"{}\" ({}).", query, count)
+            };
+
+            let mut rows = Vec::new();
+            if count > 0 {
+                rows.push(vec![InlineKeyboardButton::callback(
+                    "Show",
+                    format!("ls:{}:top:0", session_id),
+                )]);
+            }
+            rows.push(vec![InlineKeyboardButton::callback(
+                "Close",
+                format!("ls:{}:close", session_id),
+            )]);
+
+            (text, InlineKeyboardMarkup::new(rows))
+        }
     }
-
-    (text, InlineKeyboardMarkup::new(rows))
 }
 
 fn build_peek_view(
@@ -991,11 +1594,27 @@ fn build_peek_view(
     page: usize,
 ) -> (String, InlineKeyboardMarkup) {
     let indices = peek_indices(session.entries.len(), mode, page);
-    let title = match mode {
-        ListMode::Top => "Top view",
-        ListMode::Bottom => "Bottom view",
+    let total_pages = if session.entries.is_empty() {
+        0
+    } else {
+        (session.entries.len() + PAGE_SIZE - 1) / PAGE_SIZE
     };
-    let mut text = format!("{} (page {})\n", title, page + 1);
+    let mut text = match &session.kind {
+        SessionKind::List => {
+            let title = match mode {
+                ListMode::Top => "Top view",
+                ListMode::Bottom => "Bottom view",
+            };
+            format!("{} (page {})\n", title, page + 1)
+        }
+        SessionKind::Search { query } => {
+            if total_pages > 0 {
+                format!("Matches for \"{}\" (page {}/{})\n", query, page + 1, total_pages)
+            } else {
+                format!("Matches for \"{}\"\n", query)
+            }
+        }
+    };
     if indices.is_empty() {
         text.push_str("No items on this page.");
     } else {
@@ -1032,10 +1651,20 @@ fn build_peek_view(
         InlineKeyboardButton::callback("Prev", format!("ls:{}:prev", session_id)),
         InlineKeyboardButton::callback("Next", format!("ls:{}:next", session_id)),
     ]);
-    rows.push(vec![
-        InlineKeyboardButton::callback("Back", format!("ls:{}:back", session_id)),
-        InlineKeyboardButton::callback("Random", format!("ls:{}:random", session_id)),
-    ]);
+    match &session.kind {
+        SessionKind::List => {
+            rows.push(vec![
+                InlineKeyboardButton::callback("Back", format!("ls:{}:back", session_id)),
+                InlineKeyboardButton::callback("Random", format!("ls:{}:random", session_id)),
+            ]);
+        }
+        SessionKind::Search { .. } => {
+            rows.push(vec![InlineKeyboardButton::callback(
+                "Close",
+                format!("ls:{}:close", session_id),
+            )]);
+        }
+    }
 
     (text.trim_end().to_string(), InlineKeyboardMarkup::new(rows))
 }
@@ -1053,20 +1682,45 @@ fn build_selected_view(
         "Selected item not found.".to_string()
     };
 
-    let rows = vec![
-        vec![InlineKeyboardButton::callback(
-            "Mark Finished",
-            format!("ls:{}:finish", session_id),
-        )],
-        vec![InlineKeyboardButton::callback(
-            "Delete",
-            format!("ls:{}:delete", session_id),
-        )],
-        vec![InlineKeyboardButton::callback(
-            "Back",
-            format!("ls:{}:back", session_id),
-        )],
-    ];
+    let rows = match &session.kind {
+        SessionKind::List => vec![
+            vec![
+                InlineKeyboardButton::callback("Mark Finished", format!("ls:{}:finish", session_id)),
+                InlineKeyboardButton::callback(
+                    "Add Resource",
+                    format!("ls:{}:resource", session_id),
+                ),
+            ],
+            vec![
+                InlineKeyboardButton::callback(
+                    "Delete",
+                    format!("ls:{}:delete", session_id),
+                ),
+                InlineKeyboardButton::callback(
+                    "Random",
+                    format!("ls:{}:random", session_id),
+                ),
+            ],
+            vec![InlineKeyboardButton::callback(
+                "Back",
+                format!("ls:{}:back", session_id),
+            )],
+        ],
+        SessionKind::Search { .. } => vec![
+            vec![InlineKeyboardButton::callback(
+                "Add Resource",
+                format!("ls:{}:resource", session_id),
+            )],
+            vec![InlineKeyboardButton::callback(
+                "Delete",
+                format!("ls:{}:delete", session_id),
+            )],
+            vec![InlineKeyboardButton::callback(
+                "Back",
+                format!("ls:{}:back", session_id),
+            )],
+        ],
+    };
 
     (text, InlineKeyboardMarkup::new(rows))
 }
@@ -1111,16 +1765,16 @@ fn peek_indices(total: usize, mode: ListMode, page: usize) -> Vec<usize> {
 
     match mode {
         ListMode::Top => {
-            let start = page * 3;
+            let start = page * PAGE_SIZE;
             if start >= total {
                 return Vec::new();
             }
-            let end = (start + 3).min(total);
+            let end = (start + PAGE_SIZE).min(total);
             (start..end).collect()
         }
         ListMode::Bottom => {
-            let end = total.saturating_sub(page * 3);
-            let start = end.saturating_sub(3);
+            let end = total.saturating_sub(page * PAGE_SIZE);
+            let start = end.saturating_sub(PAGE_SIZE);
             if start >= end {
                 return Vec::new();
             }
@@ -1181,10 +1835,10 @@ async fn send_error(bot: &Bot, chat_id: ChatId, text: &str) -> Result<()> {
 
 async fn send_undo_message(bot: &Bot, chat_id: ChatId, undo_id: &str) -> Result<()> {
     let text = "Undo available for 30m.";
-    let kb = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
-        "Undo",
-        format!("undo:{}", undo_id),
-    )]]);
+    let kb = InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("Undo", format!("undo:{}", undo_id)),
+        InlineKeyboardButton::callback("Delete", format!("undo:{}:delete", undo_id)),
+    ]]);
     let sent = bot.send_message(chat_id, text).reply_markup(kb).await?;
     let bot = bot.clone();
     tokio::spawn(async move {
@@ -1233,6 +1887,38 @@ fn load_config(path: &Path) -> Result<Config> {
     let contents = fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
     let config: Config = toml::from_str(&contents).context("parse config")?;
     Ok(config)
+}
+
+fn list_resource_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if !dir.exists() {
+        return Ok(files);
+    }
+    let entries = fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read dir entry {}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("read file type {}", path.display()))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let is_md = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("md"))
+            .unwrap_or(false);
+        if is_md {
+            files.push(path);
+        }
+    }
+    files.sort_by(|a, b| {
+        let a_name = a.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        let b_name = b.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        a_name.cmp(&b_name)
+    });
+    Ok(files)
 }
 
 fn read_entries(path: &Path) -> Result<(Vec<String>, Vec<EntryBlock>)> {
@@ -1309,6 +1995,34 @@ fn add_entry_sync(path: &Path, entry: &EntryBlock) -> Result<AddOutcome> {
     }
     entries.insert(0, entry.clone());
     write_entries(path, &preamble, &entries)?;
+    Ok(AddOutcome::Added)
+}
+
+fn add_resource_entry_sync(path: &Path, entry_block: &str) -> Result<AddOutcome> {
+    let existing = if path.exists() {
+        fs::read_to_string(path).with_context(|| format!("read file {}", path.display()))?
+    } else {
+        String::new()
+    };
+    let normalized = normalize_line_endings(&existing);
+    let (_, entries) = parse_entries(&normalized);
+    if entries.iter().any(|e| e.block_string() == entry_block) {
+        return Ok(AddOutcome::Duplicate);
+    }
+
+    let mut preserved = normalized;
+    if !preserved.is_empty() && !preserved.ends_with('\n') {
+        preserved.push('\n');
+    }
+
+    let mut content = String::new();
+    content.push_str(entry_block);
+    content.push('\n');
+    content.push_str(&preserved);
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    atomic_write(path, content.as_bytes())?;
     Ok(AddOutcome::Added)
 }
 
@@ -1402,6 +2116,37 @@ fn prune_undo(undo: &mut Vec<UndoRecord>) {
 
 fn normalize_line_endings(input: &str) -> String {
     input.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn resource_block_from_text(text: &str) -> String {
+    let normalized = normalize_line_endings(text);
+    let mut lines: Vec<String> = normalized.lines().map(|s| s.to_string()).collect();
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    if let Some(first) = lines.get_mut(0) {
+        *first = format!("- (Auto-Resource): {}", first);
+    }
+    lines.join("\n")
+}
+
+fn sanitize_resource_filename(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    let first_line = trimmed.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        return Err(anyhow!("Provide a filename."));
+    }
+    if first_line == "." || first_line == ".." {
+        return Err(anyhow!("Invalid filename."));
+    }
+    if first_line.contains('/') || first_line.contains('\\') {
+        return Err(anyhow!("Invalid filename."));
+    }
+    let mut name = first_line.to_string();
+    if !name.to_lowercase().ends_with(".md") {
+        name.push_str(".md");
+    }
+    Ok(name)
 }
 
 fn parse_command(text: &str) -> Option<&str> {

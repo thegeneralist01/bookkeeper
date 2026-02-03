@@ -17,6 +17,16 @@ Read Later behavior
 - New items are prepended (inserted immediately after any preamble).
 - Deduping: exact full-block match (entire entry text). If identical block exists, skip add and inform user.
 - Add acknowledgment: send Saved. and auto-delete after 5s.
+- After single-item or multi-item saves, delete the user's original message.
+
+Resources behavior
+- /add <text> prompts for Reading list vs Resource.
+- Add Resource is available in the selected item view; it does not change the current view.
+- Resource adds prompt for a target .md file in resources_path (or a new filename).
+- New resource entry is prepended to the chosen file as: `- (Auto-Resource): <message contents>`.
+- Preserve additional lines after the first.
+- Deduping: exact full-block match (entire entry text). If identical block exists, skip add and inform user.
+- Resource acknowledgment: send Added to resources. and auto-delete after 5s.
 
 Finished Reading behavior
 - Mark Finished moves an entry: remove from Read Later, prepend to Finished (no separators).
@@ -63,6 +73,7 @@ Config
   - user_id (Telegram user ID)
   - read_later_path (absolute path)
   - finished_path (absolute path)
+  - resources_path (absolute path to resources directory)
   - data_dir (absolute path)
   - retry_interval_seconds (default 30, configurable)
 
