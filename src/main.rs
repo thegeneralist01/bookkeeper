@@ -2791,3 +2791,170 @@ async fn process_queue(state: std::sync::Arc<AppState>) -> Result<()> {
     *queue = remaining;
     save_queue(&state.queue_path, &queue)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn entry(text: &str) -> EntryBlock {
+        EntryBlock::from_text(text)
+    }
+
+    #[test]
+    fn normalize_markdown_links_replaces_single_link() {
+        let input = "See [post](https://example.com/post) now";
+        let (out, changed) = normalize_markdown_links(input);
+        assert!(changed);
+        assert_eq!(out, "See https://example.com/post now");
+    }
+
+    #[test]
+    fn normalize_markdown_links_replaces_multiple_links() {
+        let input = "[a](one) and [b](two)";
+        let (out, changed) = normalize_markdown_links(input);
+        assert!(changed);
+        assert_eq!(out, "one and two");
+    }
+
+    #[test]
+    fn normalize_markdown_links_ignores_invalid_markup() {
+        let input = "broken [link](missing";
+        let (out, changed) = normalize_markdown_links(input);
+        assert!(!changed);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn normalize_entry_markdown_links_updates_entry() {
+        let entry = EntryBlock::from_text("foo [x](url)\nbar");
+        let normalized = normalize_entry_markdown_links(&entry).unwrap();
+        let block = normalized.block_string();
+        assert!(block.contains("foo url"));
+        assert!(!block.contains("[x]"));
+    }
+
+    #[test]
+    fn peek_indices_filters_and_pages() {
+        let entries: Vec<EntryBlock> = (0..6)
+            .map(|i| entry(&format!("item {}", i)))
+            .collect();
+        let mut peeked = HashSet::new();
+        peeked.insert(entries[1].block_string());
+        peeked.insert(entries[3].block_string());
+
+        assert_eq!(count_unpeeked_entries(&entries, &peeked), 4);
+        assert_eq!(
+            peek_indices(&entries, &peeked, ListMode::Top, 0),
+            vec![0, 2, 4]
+        );
+        assert_eq!(
+            peek_indices(&entries, &peeked, ListMode::Top, 1),
+            vec![5]
+        );
+        assert_eq!(
+            peek_indices(&entries, &peeked, ListMode::Bottom, 0),
+            vec![5, 4, 2]
+        );
+        assert_eq!(
+            peek_indices(&entries, &peeked, ListMode::Bottom, 1),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn build_peek_view_shows_all_peeked_message() {
+        let entries = vec![entry("one"), entry("two")];
+        let session = ListSession {
+            id: "session".to_string(),
+            kind: SessionKind::List,
+            entries: entries.clone(),
+            view: ListView::Peek {
+                mode: ListMode::Top,
+                page: 0,
+            },
+            seen_random: HashSet::new(),
+            message_id: None,
+        };
+        let mut peeked = HashSet::new();
+        for entry in &entries {
+            peeked.insert(entry.block_string());
+        }
+        let (text, _kb) = build_peek_view("session", &session, ListMode::Top, 0, &peeked);
+        assert!(text.contains("Everything's been peeked already."));
+    }
+
+    #[test]
+    fn build_undos_view_includes_labels_and_previews() {
+        let record_one = UndoRecord {
+            id: "one".to_string(),
+            kind: UndoKind::Delete,
+            entry: entry("alpha").block_string(),
+            expires_at: now_ts() + 10,
+        };
+        let record_two = UndoRecord {
+            id: "two".to_string(),
+            kind: UndoKind::MoveToFinished,
+            entry: entry("beta").block_string(),
+            expires_at: now_ts() + 10,
+        };
+        let (text, _kb) = build_undos_view("session", &[record_one, record_two]);
+        assert!(text.contains("Undos (2)"));
+        assert!(text.contains("1) Deleted"));
+        assert!(text.contains("2) Moved to finished"));
+        assert!(text.contains("alpha"));
+        assert!(text.contains("beta"));
+    }
+
+    #[test]
+    fn displayed_indices_for_selected_view() {
+        let entries = vec![entry("one"), entry("two"), entry("three")];
+        let session = ListSession {
+            id: "session".to_string(),
+            kind: SessionKind::List,
+            entries,
+            view: ListView::Selected {
+                return_to: Box::new(ListView::Menu),
+                index: 1,
+            },
+            seen_random: HashSet::new(),
+            message_id: None,
+        };
+        let peeked = HashSet::new();
+        assert_eq!(displayed_indices_for_view(&session, &peeked), vec![1]);
+    }
+
+    #[test]
+    fn norm_target_index_prefers_single_peek_item() {
+        let entries = vec![entry("one"), entry("two")];
+        let mut peeked = HashSet::new();
+        peeked.insert(entries[0].block_string());
+        let session = ListSession {
+            id: "session".to_string(),
+            kind: SessionKind::List,
+            entries: entries.clone(),
+            view: ListView::Peek {
+                mode: ListMode::Top,
+                page: 0,
+            },
+            seen_random: HashSet::new(),
+            message_id: None,
+        };
+        assert_eq!(norm_target_index(&session, &peeked), Some(1));
+
+        let session_multi = ListSession {
+            entries,
+            ..session
+        };
+        let empty_peeked = HashSet::new();
+        assert_eq!(norm_target_index(&session_multi, &empty_peeked), None);
+    }
+
+    #[test]
+    fn command_keywords_are_case_insensitive() {
+        assert!(is_norm_message("NoRm"));
+        assert!(is_instant_delete_message("DEL"));
+        assert!(is_instant_delete_message("Delete"));
+        assert!(!is_instant_delete_message("remove"));
+    }
+}

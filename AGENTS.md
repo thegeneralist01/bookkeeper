@@ -8,3 +8,4 @@
 ## Build Checks
 
 - Run `cargo check` after changes (patches, features, or other code edits).
+- Create atomic commits after changes.
