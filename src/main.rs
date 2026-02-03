@@ -109,6 +109,8 @@ struct QueuedOp {
     entry: String,
     #[serde(default)]
     resource_path: Option<PathBuf>,
+    #[serde(default)]
+    updated_entry: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -118,6 +120,7 @@ enum QueuedOpKind {
     Delete,
     MoveToFinished,
     MoveToReadLater,
+    UpdateEntry,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -170,6 +173,13 @@ struct ResourceFilenamePrompt {
 }
 
 #[derive(Clone, Debug)]
+struct UndoSession {
+    chat_id: i64,
+    message_id: MessageId,
+    records: Vec<UndoRecord>,
+}
+
+#[derive(Clone, Debug)]
 enum SessionKind {
     List,
     Search { query: String },
@@ -182,6 +192,7 @@ struct ListSession {
     entries: Vec<EntryBlock>,
     view: ListView,
     seen_random: HashSet<usize>,
+    message_id: Option<MessageId>,
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +218,8 @@ struct AppState {
     config: Config,
     write_lock: Mutex<()>,
     sessions: Mutex<HashMap<i64, ListSession>>,
+    peeked: Mutex<HashSet<String>>,
+    undo_sessions: Mutex<HashMap<String, UndoSession>>,
     pickers: Mutex<HashMap<String, PickerState>>,
     add_prompts: Mutex<HashMap<String, AddPrompt>>,
     resource_pickers: Mutex<HashMap<String, ResourcePickerState>>,
@@ -248,6 +261,8 @@ async fn main() -> Result<()> {
         config: config.clone(),
         write_lock: Mutex::new(()),
         sessions: Mutex::new(HashMap::new()),
+        peeked: Mutex::new(HashSet::new()),
+        undo_sessions: Mutex::new(HashMap::new()),
         pickers: Mutex::new(HashMap::new()),
         add_prompts: Mutex::new(HashMap::new()),
         resource_pickers: Mutex::new(HashMap::new()),
@@ -320,7 +335,8 @@ async fn handle_message(
     }
 
     if let Some(prompt) = pending_prompt {
-        handle_resource_filename_response(&bot, msg.chat.id, &state, &text, prompt).await?;
+        handle_resource_filename_response(&bot, msg.chat.id, msg.id, &state, &text, prompt)
+            .await?;
         return Ok(());
     }
 
@@ -332,7 +348,7 @@ async fn handle_message(
             .trim();
         match cmd {
             "start" | "help" => {
-                let help = "Send any text to save it. Use /add <text> to choose reading list or resources. Use /list to browse. Use /delete <query> to remove an item. Use --- to split a message into multiple items.";
+                let help = "Send any text to save it. Use /add <text> to choose reading list or resources. Use /list to browse. Use /search <query> to find items. Use /undos to manage undo. Use --- to split a message into multiple items.";
                 bot.send_message(msg.chat.id, help).await?;
                 return Ok(());
             }
@@ -345,20 +361,44 @@ async fn handle_message(
                 return Ok(());
             }
             "list" => {
-                handle_list_command(bot, msg, state).await?;
+                handle_list_command(bot.clone(), msg.clone(), state).await?;
+                let _ = bot.delete_message(msg.chat.id, msg.id).await;
                 return Ok(());
             }
-            "delete" => {
+            "search" | "delete" => {
                 if rest.is_empty() {
                     send_error(&bot, msg.chat.id, "Provide a search query.").await?;
                 } else {
-                    handle_delete_command(bot, msg, state, rest).await?;
+                    handle_search_command(bot.clone(), msg.clone(), state, rest).await?;
                 }
+                let _ = bot.delete_message(msg.chat.id, msg.id).await;
+                return Ok(());
+            }
+            "reset_peeked" => {
+                reset_peeked(&state).await;
+                let _ = bot.delete_message(msg.chat.id, msg.id).await;
+                return Ok(());
+            }
+            "undos" => {
+                handle_undos_command(bot.clone(), msg.clone(), state).await?;
+                let _ = bot.delete_message(msg.chat.id, msg.id).await;
                 return Ok(());
             }
             _ => {
                 // Unknown command, fall through as text.
             }
+        }
+    }
+
+    if is_instant_delete_message(&text) {
+        if handle_instant_delete_message(&bot, &msg, &state).await? {
+            return Ok(());
+        }
+    }
+
+    if is_norm_message(&text) {
+        if handle_norm_message(&bot, &msg, &state).await? {
+            return Ok(());
         }
     }
 
@@ -369,6 +409,164 @@ async fn handle_message(
     }
 
     Ok(())
+}
+
+async fn handle_norm_message(
+    bot: &Bot,
+    msg: &Message,
+    state: &std::sync::Arc<AppState>,
+) -> Result<bool> {
+    let chat_id = msg.chat.id;
+    let mut session = {
+        let mut sessions = state.sessions.lock().await;
+        match sessions.remove(&chat_id.0) {
+            Some(session) => session,
+            None => return Ok(false),
+        }
+    };
+
+    let peeked_snapshot = state.peeked.lock().await.clone();
+    let target_index = match norm_target_index(&session, &peeked_snapshot) {
+        Some(index) => index,
+        None => {
+            state.sessions.lock().await.insert(chat_id.0, session);
+            let _ = bot.delete_message(chat_id, msg.id).await;
+            send_ephemeral(bot, chat_id, "Couldn't normalize.", ACK_TTL_SECS).await?;
+            return Ok(true);
+        }
+    };
+
+    let entry = match session.entries.get(target_index).cloned() {
+        Some(entry) => entry,
+        None => {
+            state.sessions.lock().await.insert(chat_id.0, session);
+            let _ = bot.delete_message(chat_id, msg.id).await;
+            send_ephemeral(bot, chat_id, "Couldn't normalize.", ACK_TTL_SECS).await?;
+            return Ok(true);
+        }
+    };
+
+    let Some(normalized_entry) = normalize_entry_markdown_links(&entry) else {
+        state.sessions.lock().await.insert(chat_id.0, session);
+        let _ = bot.delete_message(chat_id, msg.id).await;
+        send_ephemeral(bot, chat_id, "Couldn't normalize.", ACK_TTL_SECS).await?;
+        return Ok(true);
+    };
+
+    let op = QueuedOp {
+        kind: QueuedOpKind::UpdateEntry,
+        entry: entry.block_string(),
+        resource_path: None,
+        updated_entry: Some(normalized_entry.block_string()),
+    };
+
+    match apply_user_op(state, &op).await? {
+        UserOpOutcome::Applied(ApplyOutcome::Applied) => {
+            session.entries[target_index] = normalized_entry;
+            let (text, kb) = render_list_view(&session.id, &session, &peeked_snapshot);
+            if let Some(message_id) = session.message_id {
+                bot.edit_message_text(chat_id, message_id, text)
+                    .reply_markup(kb)
+                    .await?;
+            } else {
+                let sent = bot.send_message(chat_id, text).reply_markup(kb).await?;
+                session.message_id = Some(sent.id);
+            }
+        }
+        UserOpOutcome::Applied(ApplyOutcome::NotFound)
+        | UserOpOutcome::Applied(ApplyOutcome::Duplicate) => {
+            send_ephemeral(bot, chat_id, "Couldn't normalize.", ACK_TTL_SECS).await?;
+        }
+        UserOpOutcome::Queued => {
+            send_error(bot, chat_id, "Write failed; queued for retry.").await?;
+        }
+    }
+
+    state.sessions.lock().await.insert(chat_id.0, session);
+    let _ = bot.delete_message(chat_id, msg.id).await;
+    Ok(true)
+}
+
+async fn handle_instant_delete_message(
+    bot: &Bot,
+    msg: &Message,
+    state: &std::sync::Arc<AppState>,
+) -> Result<bool> {
+    let chat_id = msg.chat.id;
+    let mut session = {
+        let mut sessions = state.sessions.lock().await;
+        match sessions.remove(&chat_id.0) {
+            Some(session) => session,
+            None => return Ok(false),
+        }
+    };
+
+    let peeked_snapshot = state.peeked.lock().await.clone();
+    let target_index = match norm_target_index(&session, &peeked_snapshot) {
+        Some(index) => index,
+        None => {
+            state.sessions.lock().await.insert(chat_id.0, session);
+            let _ = bot.delete_message(chat_id, msg.id).await;
+            send_ephemeral(bot, chat_id, "Couldn't delete.", ACK_TTL_SECS).await?;
+            return Ok(true);
+        }
+    };
+
+    let entry_block = match session.entries.get(target_index).map(|e| e.block_string()) {
+        Some(entry) => entry,
+        None => {
+            state.sessions.lock().await.insert(chat_id.0, session);
+            let _ = bot.delete_message(chat_id, msg.id).await;
+            send_ephemeral(bot, chat_id, "Couldn't delete.", ACK_TTL_SECS).await?;
+            return Ok(true);
+        }
+    };
+
+    let op = QueuedOp {
+        kind: QueuedOpKind::Delete,
+        entry: entry_block,
+        resource_path: None,
+        updated_entry: None,
+    };
+
+    match apply_user_op(state, &op).await? {
+        UserOpOutcome::Applied(ApplyOutcome::Applied) => {
+            session.entries.remove(target_index);
+            if let ListView::Selected { return_to, .. } = session.view.clone() {
+                session.view = *return_to;
+            }
+            let _ = add_undo(state, UndoKind::Delete, op.entry.clone()).await?;
+            normalize_peek_view(&mut session, &peeked_snapshot);
+            let (text, kb) = render_list_view(&session.id, &session, &peeked_snapshot);
+            if let Some(message_id) = session.message_id {
+                bot.edit_message_text(chat_id, message_id, text)
+                    .reply_markup(kb)
+                    .await?;
+            } else {
+                let sent = bot.send_message(chat_id, text).reply_markup(kb).await?;
+                session.message_id = Some(sent.id);
+            }
+        }
+        UserOpOutcome::Applied(ApplyOutcome::NotFound)
+        | UserOpOutcome::Applied(ApplyOutcome::Duplicate) => {
+            send_ephemeral(bot, chat_id, "Couldn't delete.", ACK_TTL_SECS).await?;
+        }
+        UserOpOutcome::Queued => {
+            send_error(bot, chat_id, "Write failed; queued for retry.").await?;
+        }
+    }
+
+    state.sessions.lock().await.insert(chat_id.0, session);
+    let _ = bot.delete_message(chat_id, msg.id).await;
+    Ok(true)
+}
+
+fn is_instant_delete_message(text: &str) -> bool {
+    matches!(text.trim().to_lowercase().as_str(), "del" | "delete")
+}
+
+fn is_norm_message(text: &str) -> bool {
+    text.trim().eq_ignore_ascii_case("norm")
 }
 
 async fn handle_callback(
@@ -390,6 +588,8 @@ async fn handle_callback(
             handle_add_callback(bot, q, state).await?;
         } else if data.starts_with("res:") {
             handle_resource_callback(bot, q, state).await?;
+        } else if data.starts_with("undos:") {
+            handle_undos_callback(bot, q, state).await?;
         } else if data.starts_with("undo:") {
             handle_undo_callback(bot, q, state).await?;
         }
@@ -405,27 +605,30 @@ async fn handle_list_command(
 ) -> Result<()> {
     let entries = read_entries(&state.config.read_later_path)?.1;
     let session_id = short_id();
-    let session = ListSession {
+    let mut session = ListSession {
         id: session_id.clone(),
         kind: SessionKind::List,
         entries,
         view: ListView::Menu,
         seen_random: HashSet::new(),
+        message_id: None,
     };
+
+    let (text, kb) = build_menu_view(&session_id, &session);
+    let sent = bot
+        .send_message(msg.chat.id, text)
+        .reply_markup(kb)
+        .await?;
+    session.message_id = Some(sent.id);
     state
         .sessions
         .lock()
         .await
-        .insert(msg.chat.id.0, session.clone());
-
-    let (text, kb) = build_menu_view(&session_id, &session);
-    bot.send_message(msg.chat.id, text)
-        .reply_markup(kb)
-        .await?;
+        .insert(msg.chat.id.0, session);
     Ok(())
 }
 
-async fn handle_delete_command(
+async fn handle_search_command(
     bot: Bot,
     msg: Message,
     state: std::sync::Arc<AppState>,
@@ -440,7 +643,7 @@ async fn handle_delete_command(
     }
 
     let session_id = short_id();
-    let session = ListSession {
+    let mut session = ListSession {
         id: session_id.clone(),
         kind: SessionKind::Search {
             query: query.to_string(),
@@ -451,18 +654,64 @@ async fn handle_delete_command(
             page: 0,
         },
         seen_random: HashSet::new(),
+        message_id: None,
     };
 
+    let peeked_snapshot = state.peeked.lock().await.clone();
+    let displayed_indices = displayed_indices_for_view(&session, &peeked_snapshot);
+    let (text, kb) = render_list_view(&session_id, &session, &peeked_snapshot);
+    let sent = bot
+        .send_message(msg.chat.id, text)
+        .reply_markup(kb)
+        .await?;
+    session.message_id = Some(sent.id);
+    if !displayed_indices.is_empty() {
+        let mut peeked = state.peeked.lock().await;
+        for idx in displayed_indices {
+            if let Some(entry) = session.entries.get(idx) {
+                peeked.insert(entry.block_string());
+            }
+        }
+    }
     state
         .sessions
         .lock()
         .await
-        .insert(msg.chat.id.0, session.clone());
+        .insert(msg.chat.id.0, session);
+    Ok(())
+}
 
-    let (text, kb) = render_list_view(&session_id, &session);
-    bot.send_message(msg.chat.id, text)
-        .reply_markup(kb)
-        .await?;
+async fn handle_undos_command(
+    bot: Bot,
+    msg: Message,
+    state: std::sync::Arc<AppState>,
+) -> Result<()> {
+    let (records, undo_snapshot) = {
+        let mut undo = state.undo.lock().await;
+        prune_undo(&mut undo);
+        let snapshot = undo.clone();
+        (undo.clone(), snapshot)
+    };
+    save_undo(&state.undo_path, &undo_snapshot)?;
+
+    if records.is_empty() {
+        send_ephemeral(&bot, msg.chat.id, "No undos.", ACK_TTL_SECS).await?;
+        return Ok(());
+    }
+
+    let session_id = short_id();
+    let (text, kb) = build_undos_view(&session_id, &records);
+    let sent = bot.send_message(msg.chat.id, text).reply_markup(kb).await?;
+    let session = UndoSession {
+        chat_id: msg.chat.id.0,
+        message_id: sent.id,
+        records,
+    };
+    state
+        .undo_sessions
+        .lock()
+        .await
+        .insert(session_id, session);
     Ok(())
 }
 
@@ -478,6 +727,7 @@ async fn handle_single_item(
         kind: QueuedOpKind::Add,
         entry: entry.block_string(),
         resource_path: None,
+        updated_entry: None,
     };
 
     match apply_user_op(&state, &op).await? {
@@ -778,6 +1028,7 @@ async fn add_resource_from_text(
         kind: QueuedOpKind::AddResource,
         entry: entry_block,
         resource_path: Some(resource_path),
+        updated_entry: None,
     };
 
     match apply_user_op(state, &op).await? {
@@ -805,6 +1056,7 @@ async fn add_resource_from_text(
 async fn handle_resource_filename_response(
     bot: &Bot,
     chat_id: ChatId,
+    message_id: MessageId,
     state: &std::sync::Arc<AppState>,
     text: &str,
     prompt: ResourceFilenamePrompt,
@@ -821,6 +1073,7 @@ async fn handle_resource_filename_response(
                     ..prompt
                 },
             );
+            let _ = bot.delete_message(chat_id, message_id).await;
             return Ok(());
         }
     };
@@ -839,6 +1092,7 @@ async fn handle_resource_filename_response(
     let _ = bot
         .delete_message(chat_id, prompt.prompt_message_id)
         .await;
+    let _ = bot.delete_message(chat_id, message_id).await;
     Ok(())
 }
 
@@ -881,6 +1135,8 @@ async fn handle_list_callback(
         }
         session
     };
+
+    let peeked_snapshot = state.peeked.lock().await.clone();
 
     match action {
         "menu" => {
@@ -936,24 +1192,35 @@ async fn handle_list_callback(
             if matches!(&session.kind, SessionKind::List) {
                 if session.entries.is_empty() {
                     // Stay in place.
-                } else if session.seen_random.len() >= session.entries.len() {
-                    // No unseen items left.
-                    send_error(
-                        &bot,
-                        message.chat.id,
-                        "All items have been shown in this session.",
-                    )
-                    .await?;
                 } else {
                     let mut remaining: Vec<usize> = (0..session.entries.len())
                         .filter(|i| !session.seen_random.contains(i))
+                        .filter(|i| {
+                            session
+                                .entries
+                                .get(*i)
+                                .map(|entry| !peeked_snapshot.contains(&entry.block_string()))
+                                .unwrap_or(false)
+                        })
                         .collect();
+                    if remaining.is_empty() {
+                        send_ephemeral(
+                            &bot,
+                            message.chat.id,
+                            "Everything's been peeked already.",
+                            ACK_TTL_SECS,
+                        )
+                        .await?;
+                        // Stay in place.
+                        session.view = ListView::Menu;
+                    } else {
                     let mut rng = rand::thread_rng();
                     remaining.shuffle(&mut rng);
                     if let Some(index) = remaining.first().copied() {
                         session.seen_random.insert(index);
                         let return_to = Box::new(session.view.clone());
                         session.view = ListView::Selected { return_to, index };
+                    }
                     }
                 }
             }
@@ -962,9 +1229,10 @@ async fn handle_list_callback(
             if let ListView::Peek { mode, page } = session.view.clone() {
                 let pick_index = parts.next().and_then(|p| p.parse::<usize>().ok());
                 if let Some(pick_index) = pick_index {
-                    if let Some(entry_index) = peek_indices(session.entries.len(), mode, page)
-                        .get(pick_index.saturating_sub(1))
-                        .copied()
+                    if let Some(entry_index) =
+                        peek_indices(&session.entries, &peeked_snapshot, mode, page)
+                            .get(pick_index.saturating_sub(1))
+                            .copied()
                     {
                         let return_to = Box::new(ListView::Peek { mode, page });
                         session.view = ListView::Selected {
@@ -983,17 +1251,16 @@ async fn handle_list_callback(
                         kind: QueuedOpKind::MoveToFinished,
                         entry: entry_block.clone(),
                         resource_path: None,
+                        updated_entry: None,
                     };
                     match apply_user_op(&state, &op).await? {
                         UserOpOutcome::Applied(ApplyOutcome::Applied) => {
                             session.entries.remove(index);
                             session.view = *return_to;
-                            normalize_peek_view(&mut session);
+                            normalize_peek_view(&mut session, &peeked_snapshot);
                             send_ephemeral(&bot, message.chat.id, "Moved.", ACK_TTL_SECS)
                                 .await?;
-                            let undo_id = add_undo(&state, UndoKind::MoveToFinished, entry_block)
-                                .await?;
-                            send_undo_message(&bot, message.chat.id, &undo_id).await?;
+                            let _ = add_undo(&state, UndoKind::MoveToFinished, entry_block).await?;
                         }
                         UserOpOutcome::Applied(ApplyOutcome::NotFound) => {
                             send_error(&bot, message.chat.id, "Item not found.").await?;
@@ -1069,6 +1336,7 @@ async fn handle_list_callback(
                             kind: QueuedOpKind::Delete,
                             entry: entry_block.clone(),
                             resource_path: None,
+                            updated_entry: None,
                         };
                         match apply_user_op(&state, &op).await? {
                             UserOpOutcome::Applied(ApplyOutcome::Applied) => {
@@ -1078,10 +1346,8 @@ async fn handle_list_callback(
                                 } else {
                                     session.view = ListView::Menu;
                                 }
-                                normalize_peek_view(&mut session);
-                                let undo_id = add_undo(&state, UndoKind::Delete, entry_block)
-                                    .await?;
-                                send_undo_message(&bot, message.chat.id, &undo_id).await?;
+                                normalize_peek_view(&mut session, &peeked_snapshot);
+                                let _ = add_undo(&state, UndoKind::Delete, entry_block).await?;
                             }
                             UserOpOutcome::Applied(ApplyOutcome::NotFound) => {
                                 send_error(&bot, message.chat.id, "Item not found.").await?;
@@ -1110,11 +1376,22 @@ async fn handle_list_callback(
         _ => {}
     }
 
-    let (text, kb) = render_list_view(&session.id, &session);
+    session.message_id = Some(message.id);
+    let displayed_indices = displayed_indices_for_view(&session, &peeked_snapshot);
+    let (text, kb) = render_list_view(&session.id, &session, &peeked_snapshot);
+    let session_clone = session.clone();
     state.sessions.lock().await.insert(chat_id, session);
     bot.edit_message_text(message.chat.id, message.id, text)
         .reply_markup(kb)
         .await?;
+    if !displayed_indices.is_empty() {
+        let mut peeked = state.peeked.lock().await;
+        for idx in displayed_indices {
+            if let Some(entry) = session_clone.entries.get(idx) {
+                peeked.insert(entry.block_string());
+            }
+        }
+    }
     bot.answer_callback_query(q.id).await?;
     Ok(())
 }
@@ -1197,6 +1474,7 @@ async fn handle_picker_callback(
                     kind: QueuedOpKind::Add,
                     entry: entry.block_string(),
                     resource_path: None,
+                    updated_entry: None,
                 };
                 match apply_user_op(&state, &op).await? {
                     UserOpOutcome::Applied(ApplyOutcome::Applied) => added += 1,
@@ -1234,6 +1512,120 @@ async fn handle_picker_callback(
         state.pickers.lock().await.insert(picker_id, picker);
     }
 
+    bot.answer_callback_query(q.id).await?;
+    Ok(())
+}
+
+async fn handle_undos_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    state: std::sync::Arc<AppState>,
+) -> Result<()> {
+    let Some(message) = q.message.clone() else {
+        return Ok(());
+    };
+    let Some(data) = q.data.as_deref() else {
+        return Ok(());
+    };
+
+    let mut parts = data.split(':');
+    let _ = parts.next();
+    let session_id = match parts.next() {
+        Some(id) => id.to_string(),
+        None => return Ok(()),
+    };
+    let action = match parts.next() {
+        Some(action) => action,
+        None => return Ok(()),
+    };
+
+    let session = {
+        let mut sessions = state.undo_sessions.lock().await;
+        let session = match sessions.remove(&session_id) {
+            Some(session) => session,
+            None => {
+                bot.answer_callback_query(q.id).await?;
+                return Ok(());
+            }
+        };
+        if session.chat_id != message.chat.id.0 || session.message_id != message.id {
+            sessions.insert(session_id, session);
+            bot.answer_callback_query(q.id).await?;
+            return Ok(());
+        }
+        session
+    };
+
+    match action {
+        "close" => {
+            let _ = bot.delete_message(message.chat.id, message.id).await;
+            bot.answer_callback_query(q.id).await?;
+            return Ok(());
+        }
+        "undo" => {
+            let index = parts.next().and_then(|p| p.parse::<usize>().ok());
+            let Some(index) = index else {
+                bot.answer_callback_query(q.id).await?;
+                return Ok(());
+            };
+            let Some(record) = session.records.get(index).cloned() else {
+                bot.answer_callback_query(q.id).await?;
+                return Ok(());
+            };
+            let op = match record.kind {
+                UndoKind::MoveToFinished => QueuedOp {
+                    kind: QueuedOpKind::MoveToReadLater,
+                    entry: record.entry,
+                    resource_path: None,
+                    updated_entry: None,
+                },
+                UndoKind::Delete => QueuedOp {
+                    kind: QueuedOpKind::Add,
+                    entry: record.entry,
+                    resource_path: None,
+                    updated_entry: None,
+                },
+            };
+
+            let mut undo = state.undo.lock().await;
+            prune_undo(&mut undo);
+            undo.retain(|r| r.id != record.id);
+            save_undo(&state.undo_path, &undo)?;
+
+            match apply_user_op(&state, &op).await? {
+                UserOpOutcome::Applied(ApplyOutcome::Applied)
+                | UserOpOutcome::Applied(ApplyOutcome::Duplicate)
+                | UserOpOutcome::Applied(ApplyOutcome::NotFound) => {
+                    send_ephemeral(&bot, message.chat.id, "Undone.", ACK_TTL_SECS).await?;
+                }
+                UserOpOutcome::Queued => {
+                    send_error(&bot, message.chat.id, "Write failed; queued for retry.")
+                        .await?;
+                }
+            }
+        }
+        "delete" => {
+            let index = parts.next().and_then(|p| p.parse::<usize>().ok());
+            let Some(index) = index else {
+                bot.answer_callback_query(q.id).await?;
+                return Ok(());
+            };
+            let Some(record) = session.records.get(index).cloned() else {
+                bot.answer_callback_query(q.id).await?;
+                return Ok(());
+            };
+            let mut undo = state.undo.lock().await;
+            prune_undo(&mut undo);
+            undo.retain(|r| r.id != record.id);
+            save_undo(&state.undo_path, &undo)?;
+        }
+        _ => {
+            bot.answer_callback_query(q.id).await?;
+            return Ok(());
+        }
+    }
+
+    let _ = bot.delete_message(message.chat.id, message.id).await;
     bot.answer_callback_query(q.id).await?;
     Ok(())
 }
@@ -1284,11 +1676,13 @@ async fn handle_undo_callback(
                 kind: QueuedOpKind::MoveToReadLater,
                 entry: record.entry,
                 resource_path: None,
+                updated_entry: None,
             },
             UndoKind::Delete => QueuedOp {
                 kind: QueuedOpKind::Add,
                 entry: record.entry,
                 resource_path: None,
+                updated_entry: None,
             },
         };
 
@@ -1301,6 +1695,9 @@ async fn handle_undo_callback(
             UserOpOutcome::Queued => {
                 send_error(&bot, chat_id, "Write failed; queued for retry.").await?;
             }
+        }
+        if let Some(message) = q.message.clone() {
+            let _ = bot.delete_message(message.chat.id, message.id).await;
         }
     } else {
         send_error(&bot, chat_id_from_user_id(q.from.id.0), "Undo not found.").await?;
@@ -1382,6 +1779,21 @@ async fn apply_op(state: &std::sync::Arc<AppState>, op: &QueuedOp) -> Result<App
                 ModifyOutcome::NotFound => ApplyOutcome::NotFound,
             })
         }
+        QueuedOpKind::UpdateEntry => {
+            let updated_entry = op
+                .updated_entry
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing updated entry"))?;
+            let updated_entry = EntryBlock::from_block(updated_entry);
+            let outcome = with_retries(|| {
+                update_entry_sync(&state.config.read_later_path, &op.entry, &updated_entry)
+            })
+            .await?;
+            Ok(match outcome {
+                ModifyOutcome::Applied => ApplyOutcome::Applied,
+                ModifyOutcome::NotFound => ApplyOutcome::NotFound,
+            })
+        }
     }
 }
 
@@ -1428,6 +1840,90 @@ fn matches_query(entry: &EntryBlock, query: &str) -> bool {
     needle
         .split_whitespace()
         .all(|term| haystack.contains(term))
+}
+
+fn displayed_indices_for_view(
+    session: &ListSession,
+    peeked: &HashSet<String>,
+) -> Vec<usize> {
+    match session.view {
+        ListView::Peek { mode, page } => peek_indices(&session.entries, peeked, mode, page),
+        ListView::Selected { index, .. } => vec![index],
+        _ => Vec::new(),
+    }
+}
+
+fn norm_target_index(session: &ListSession, peeked: &HashSet<String>) -> Option<usize> {
+    match &session.view {
+        ListView::Selected { index, .. } => Some(*index),
+        ListView::Peek { mode, page } => {
+            let indices = peek_indices(&session.entries, peeked, *mode, *page);
+            if indices.len() == 1 {
+                indices.first().copied()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn normalize_entry_markdown_links(entry: &EntryBlock) -> Option<EntryBlock> {
+    let mut changed = false;
+    let mut lines = Vec::with_capacity(entry.lines.len());
+    for line in &entry.lines {
+        let (normalized, line_changed) = normalize_markdown_links(line);
+        if line_changed {
+            changed = true;
+        }
+        lines.push(normalized);
+    }
+    if changed {
+        Some(EntryBlock { lines })
+    } else {
+        None
+    }
+}
+
+fn normalize_markdown_links(text: &str) -> (String, bool) {
+    if !text.contains('[') {
+        return (text.to_string(), false);
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    let mut changed = false;
+
+    while let Some(start_rel) = text[index..].find('[') {
+        let start = index + start_rel;
+        out.push_str(&text[index..start]);
+
+        let label_start = start + 1;
+        let Some(label_end_rel) = text[label_start..].find(']') else {
+            out.push_str(&text[start..]);
+            return (out, changed);
+        };
+        let label_end = label_start + label_end_rel;
+        let after_label = label_end + 1;
+        if after_label >= text.len() || !text[after_label..].starts_with('(') {
+            out.push_str(&text[start..after_label]);
+            index = after_label;
+            continue;
+        }
+
+        let url_start = after_label + 1;
+        let Some(url_end_rel) = text[url_start..].find(')') else {
+            out.push_str(&text[start..]);
+            return (out, changed);
+        };
+        let url_end = url_start + url_end_rel;
+        out.push_str(&text[url_start..url_end]);
+        changed = true;
+        index = url_end + 1;
+    }
+
+    out.push_str(&text[index..]);
+    (out, changed)
 }
 
 fn build_picker_text(items: &[String], selected: &[bool]) -> String {
@@ -1522,10 +2018,14 @@ fn build_resource_picker_keyboard(
     InlineKeyboardMarkup::new(rows)
 }
 
-fn render_list_view(session_id: &str, session: &ListSession) -> (String, InlineKeyboardMarkup) {
+fn render_list_view(
+    session_id: &str,
+    session: &ListSession,
+    peeked: &HashSet<String>,
+) -> (String, InlineKeyboardMarkup) {
     match &session.view {
         ListView::Menu => build_menu_view(session_id, session),
-        ListView::Peek { mode, page } => build_peek_view(session_id, session, *mode, *page),
+        ListView::Peek { mode, page } => build_peek_view(session_id, session, *mode, *page, peeked),
         ListView::Selected { index, .. } => build_selected_view(session_id, session, *index),
         ListView::DeleteConfirm { step, index, .. } => {
             build_delete_confirm_view(session_id, session, *index, *step)
@@ -1592,12 +2092,14 @@ fn build_peek_view(
     session: &ListSession,
     mode: ListMode,
     page: usize,
+    peeked: &HashSet<String>,
 ) -> (String, InlineKeyboardMarkup) {
-    let indices = peek_indices(session.entries.len(), mode, page);
-    let total_pages = if session.entries.is_empty() {
+    let total_unpeeked = count_unpeeked_entries(&session.entries, peeked);
+    let indices = peek_indices(&session.entries, peeked, mode, page);
+    let total_pages = if total_unpeeked == 0 {
         0
     } else {
-        (session.entries.len() + PAGE_SIZE - 1) / PAGE_SIZE
+        (total_unpeeked + PAGE_SIZE - 1) / PAGE_SIZE
     };
     let mut text = match &session.kind {
         SessionKind::List => {
@@ -1605,7 +2107,8 @@ fn build_peek_view(
                 ListMode::Top => "Top view",
                 ListMode::Bottom => "Bottom view",
             };
-            format!("{} (page {})\n", title, page + 1)
+            let page_display = if total_pages == 0 { 0 } else { page + 1 };
+            format!("{} (page {})\n", title, page_display)
         }
         SessionKind::Search { query } => {
             if total_pages > 0 {
@@ -1615,7 +2118,9 @@ fn build_peek_view(
             }
         }
     };
-    if indices.is_empty() {
+    if total_unpeeked == 0 {
+        text.push_str("Everything's been peeked already.");
+    } else if indices.is_empty() {
         text.push_str("No items on this page.");
     } else {
         for (display_index, entry_index) in indices.iter().enumerate() {
@@ -1725,6 +2230,49 @@ fn build_selected_view(
     (text, InlineKeyboardMarkup::new(rows))
 }
 
+fn build_undos_view(session_id: &str, records: &[UndoRecord]) -> (String, InlineKeyboardMarkup) {
+    let mut text = format!("Undos ({})\n\n", records.len());
+    for (idx, record) in records.iter().enumerate() {
+        let label = match record.kind {
+            UndoKind::MoveToFinished => "Moved to finished",
+            UndoKind::Delete => "Deleted",
+        };
+        text.push_str(&format!("{}) {}\n", idx + 1, label));
+        let preview = undo_preview(&record.entry);
+        if let Some(first) = preview.get(0) {
+            text.push_str("   ");
+            text.push_str(first);
+            text.push('\n');
+        }
+        if let Some(second) = preview.get(1) {
+            text.push_str("   ");
+            text.push_str(second);
+            text.push('\n');
+        }
+        text.push('\n');
+    }
+
+    let mut rows = Vec::new();
+    for (idx, _) in records.iter().enumerate() {
+        rows.push(vec![
+            InlineKeyboardButton::callback(
+                format!("Undo {}", idx + 1),
+                format!("undos:{}:undo:{}", session_id, idx),
+            ),
+            InlineKeyboardButton::callback(
+                format!("Delete {}", idx + 1),
+                format!("undos:{}:delete:{}", session_id, idx),
+            ),
+        ]);
+    }
+    rows.push(vec![InlineKeyboardButton::callback(
+        "Close",
+        format!("undos:{}:close", session_id),
+    )]);
+
+    (text.trim_end().to_string(), InlineKeyboardMarkup::new(rows))
+}
+
 fn build_delete_confirm_view(
     session_id: &str,
     session: &ListSession,
@@ -1758,34 +2306,51 @@ fn build_delete_confirm_view(
     (text.trim_end().to_string(), InlineKeyboardMarkup::new(rows))
 }
 
-fn peek_indices(total: usize, mode: ListMode, page: usize) -> Vec<usize> {
-    if total == 0 {
-        return Vec::new();
-    }
-
-    match mode {
-        ListMode::Top => {
-            let start = page * PAGE_SIZE;
-            if start >= total {
-                return Vec::new();
-            }
-            let end = (start + PAGE_SIZE).min(total);
-            (start..end).collect()
-        }
-        ListMode::Bottom => {
-            let end = total.saturating_sub(page * PAGE_SIZE);
-            let start = end.saturating_sub(PAGE_SIZE);
-            if start >= end {
-                return Vec::new();
-            }
-            (start..end).collect()
-        }
-    }
+fn count_unpeeked_entries(entries: &[EntryBlock], peeked: &HashSet<String>) -> usize {
+    entries
+        .iter()
+        .filter(|entry| !peeked.contains(&entry.block_string()))
+        .count()
 }
 
-fn normalize_peek_view(session: &mut ListSession) {
+fn ordered_unpeeked_indices(
+    entries: &[EntryBlock],
+    peeked: &HashSet<String>,
+    mode: ListMode,
+) -> Vec<usize> {
+    let mut indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| !peeked.contains(&entry.block_string()))
+        .map(|(idx, _)| idx)
+        .collect();
+    if matches!(mode, ListMode::Bottom) {
+        indices.reverse();
+    }
+    indices
+}
+
+fn peek_indices(
+    entries: &[EntryBlock],
+    peeked: &HashSet<String>,
+    mode: ListMode,
+    page: usize,
+) -> Vec<usize> {
+    let ordered = ordered_unpeeked_indices(entries, peeked, mode);
+    if ordered.is_empty() {
+        return Vec::new();
+    }
+    let start = page * PAGE_SIZE;
+    if start >= ordered.len() {
+        return Vec::new();
+    }
+    let end = (start + PAGE_SIZE).min(ordered.len());
+    ordered[start..end].to_vec()
+}
+
+fn normalize_peek_view(session: &mut ListSession, peeked: &HashSet<String>) {
     if let ListView::Peek { mode, page } = session.view.clone() {
-        let indices = peek_indices(session.entries.len(), mode, page);
+        let indices = peek_indices(&session.entries, peeked, mode, page);
         if indices.is_empty() && page > 0 {
             session.view = ListView::Peek {
                 mode,
@@ -1813,6 +2378,11 @@ fn preview_text(text: &str) -> Vec<String> {
     out
 }
 
+fn undo_preview(entry: &str) -> Vec<String> {
+    let entry = EntryBlock::from_block(entry);
+    entry.preview_lines()
+}
+
 async fn send_ephemeral(
     bot: &Bot,
     chat_id: ChatId,
@@ -1833,19 +2403,9 @@ async fn send_error(bot: &Bot, chat_id: ChatId, text: &str) -> Result<()> {
     Ok(())
 }
 
-async fn send_undo_message(bot: &Bot, chat_id: ChatId, undo_id: &str) -> Result<()> {
-    let text = "Undo available for 30m.";
-    let kb = InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback("Undo", format!("undo:{}", undo_id)),
-        InlineKeyboardButton::callback("Delete", format!("undo:{}:delete", undo_id)),
-    ]]);
-    let sent = bot.send_message(chat_id, text).reply_markup(kb).await?;
-    let bot = bot.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(UNDO_TTL_SECS)).await;
-        let _ = bot.delete_message(chat_id, sent.id).await;
-    });
-    Ok(())
+async fn reset_peeked(state: &std::sync::Arc<AppState>) {
+    let mut peeked = state.peeked.lock().await;
+    peeked.clear();
 }
 
 async fn add_undo(
@@ -2035,6 +2595,23 @@ fn delete_entry_sync(path: &Path, entry_block: &str) -> Result<ModifyOutcome> {
         return Ok(ModifyOutcome::NotFound);
     };
     entries.remove(pos);
+    write_entries(path, &preamble, &entries)?;
+    Ok(ModifyOutcome::Applied)
+}
+
+fn update_entry_sync(
+    path: &Path,
+    entry_block: &str,
+    updated_entry: &EntryBlock,
+) -> Result<ModifyOutcome> {
+    let (preamble, mut entries) = read_entries(path)?;
+    let pos = entries
+        .iter()
+        .position(|e| e.block_string() == entry_block);
+    let Some(pos) = pos else {
+        return Ok(ModifyOutcome::NotFound);
+    };
+    entries[pos] = updated_entry.clone();
     write_entries(path, &preamble, &entries)?;
     Ok(ModifyOutcome::Applied)
 }
