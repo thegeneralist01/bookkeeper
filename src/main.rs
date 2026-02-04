@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageId};
 use tokio::sync::Mutex;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
 use uuid::Uuid;
 
 const ACK_TTL_SECS: u64 = 5;
@@ -1872,6 +1872,7 @@ async fn queue_op(state: &std::sync::Arc<AppState>, op: QueuedOp) -> Result<()> 
 }
 
 fn run_sync(sync: &SyncConfig) -> Result<SyncOutcome> {
+    ensure_git_available()?;
     if !sync.repo_path.exists() {
         return Err(anyhow!(
             "Sync repo path not found: {}",
@@ -1944,7 +1945,7 @@ fn run_sync(sync: &SyncConfig) -> Result<SyncOutcome> {
     }
 
     let askpass = create_askpass_script()?;
-    let askpass_path = askpass.path().to_string_lossy().to_string();
+    let askpass_path = askpass.to_string_lossy().to_string();
     let push_env = vec![
         ("GIT_TERMINAL_PROMPT", "0".to_string()),
         ("GIT_ASKPASS", askpass_path),
@@ -1975,12 +1976,29 @@ fn run_git(repo_path: &Path, args: &[&str], envs: Vec<(&str, String)>) -> Result
     for (key, value) in envs {
         cmd.env(key, value);
     }
-    let output = cmd.output().context("run git command")?;
+    let output = cmd
+        .output()
+        .with_context(|| format!("run git command: git {}", args.join(" ")))?;
     Ok(GitOutput {
         status: output.status,
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
     })
+}
+
+fn ensure_git_available() -> Result<()> {
+    match Command::new("git").arg("--version").output() {
+        Ok(output) => {
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(anyhow!("Git unavailable: git --version failed."))
+            }
+        }
+        Err(_) => Err(anyhow!(
+            "Git is not available in PATH. Add git to the service path."
+        )),
+    }
 }
 
 fn format_git_error(action: &str, output: &GitOutput) -> String {
@@ -2072,7 +2090,7 @@ fn sync_commit_message() -> String {
     format!("Bot sync {}", Local::now().format("%Y-%m-%d %H:%M:%S"))
 }
 
-fn create_askpass_script() -> Result<NamedTempFile> {
+fn create_askpass_script() -> Result<TempPath> {
     let mut file = NamedTempFile::new().context("create askpass script")?;
     file.write_all(
         b"#!/bin/sh\ncase \"$1\" in\n*Username*) echo \"$GIT_SYNC_USERNAME\" ;;\n*Password*) echo \"$GIT_SYNC_PAT\" ;;\n*) echo \"\" ;;\nesac\n",
@@ -2081,7 +2099,7 @@ fn create_askpass_script() -> Result<NamedTempFile> {
     let mut perms = file.as_file().metadata()?.permissions();
     perms.set_mode(0o700);
     fs::set_permissions(file.path(), perms).context("chmod askpass script")?;
-    Ok(file)
+    Ok(file.into_temp_path())
 }
 
 fn split_items(text: &str) -> Vec<String> {
