@@ -1,10 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use chrono::Local;
 use clap::Parser;
 use log::error;
 use rand::seq::SliceRandom;
@@ -12,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageId};
 use tokio::sync::Mutex;
+use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 const ACK_TTL_SECS: u64 = 5;
@@ -29,6 +33,13 @@ struct Config {
     resources_path: PathBuf,
     data_dir: PathBuf,
     retry_interval_seconds: Option<u64>,
+    sync: Option<SyncConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct SyncConfig {
+    repo_path: PathBuf,
+    token_file: PathBuf,
 }
 
 #[derive(Parser, Debug)]
@@ -348,7 +359,7 @@ async fn handle_message(
             .trim();
         match cmd {
             "start" | "help" => {
-                let help = "Send any text to save it. Use /add <text> to choose reading list or resources. Use /list to browse. Use /search <query> to find items. Use /undos to manage undo. Use --- to split a message into multiple items.";
+                let help = "Send any text to save it. Use /add <text> to choose reading list or resources. Use /list to browse. Use /search <query> to find items. Use /undos to manage undo. Use /sync to push changes. Use --- to split a message into multiple items.";
                 bot.send_message(msg.chat.id, help).await?;
                 return Ok(());
             }
@@ -381,6 +392,11 @@ async fn handle_message(
             }
             "undos" => {
                 handle_undos_command(bot.clone(), msg.clone(), state).await?;
+                let _ = bot.delete_message(msg.chat.id, msg.id).await;
+                return Ok(());
+            }
+            "sync" => {
+                handle_sync_command(bot.clone(), msg.clone(), state).await?;
                 let _ = bot.delete_message(msg.chat.id, msg.id).await;
                 return Ok(());
             }
@@ -678,6 +694,41 @@ async fn handle_search_command(
         .lock()
         .await
         .insert(msg.chat.id.0, session);
+    Ok(())
+}
+
+async fn handle_sync_command(
+    bot: Bot,
+    msg: Message,
+    state: std::sync::Arc<AppState>,
+) -> Result<()> {
+    let Some(sync) = state.config.sync.clone() else {
+        send_error(
+            &bot,
+            msg.chat.id,
+            "Sync not configured. Set settings.sync.repo_path and settings.sync.token_file.",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let chat_id = msg.chat.id;
+    let outcome = tokio::task::spawn_blocking(move || run_sync(&sync))
+        .await
+        .context("sync task failed")?;
+
+    match outcome {
+        Ok(SyncOutcome::NoChanges) => {
+            send_ephemeral(&bot, chat_id, "Nothing to sync.", ACK_TTL_SECS).await?;
+        }
+        Ok(SyncOutcome::Pushed) => {
+            send_ephemeral(&bot, chat_id, "Synced.", ACK_TTL_SECS).await?;
+        }
+        Err(err) => {
+            send_error(&bot, chat_id, &err.to_string()).await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1809,10 +1860,228 @@ enum UserOpOutcome {
     Queued,
 }
 
+enum SyncOutcome {
+    NoChanges,
+    Pushed,
+}
+
 async fn queue_op(state: &std::sync::Arc<AppState>, op: QueuedOp) -> Result<()> {
     let mut queue = state.queue.lock().await;
     queue.push(op);
     save_queue(&state.queue_path, &queue)
+}
+
+fn run_sync(sync: &SyncConfig) -> Result<SyncOutcome> {
+    if !sync.repo_path.exists() {
+        return Err(anyhow!(
+            "Sync repo path not found: {}",
+            sync.repo_path.display()
+        ));
+    }
+
+    let repo_check = run_git(
+        &sync.repo_path,
+        &["rev-parse", "--is-inside-work-tree"],
+        Vec::new(),
+    )?;
+    if !repo_check.status.success() || repo_check.stdout.trim() != "true" {
+        return Err(anyhow!(
+            "Sync repo path not found or not a git repository: {}",
+            sync.repo_path.display()
+        ));
+    }
+
+    let token = read_token_file(&sync.token_file)?;
+
+    let remotes = git_remote_names(&sync.repo_path)?;
+    let remote = if remotes.iter().any(|name| name == "origin") {
+        "origin".to_string()
+    } else {
+        remotes
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("Git remote not configured."))?
+    };
+    let remote_url = git_remote_url(&sync.repo_path, &remote)?;
+    if !remote_url.starts_with("https://") {
+        return Err(anyhow!(
+            "Sync requires HTTPS remote for PAT auth. Remote is {}",
+            remote_url
+        ));
+    }
+
+    let username = extract_https_username(&remote_url).unwrap_or_else(|| "x-access-token".to_string());
+
+    let status_output = run_git(&sync.repo_path, &["status", "--porcelain"], Vec::new())?;
+    if !status_output.status.success() {
+        return Err(anyhow!(format_git_error("git status", &status_output)));
+    }
+    if status_output.stdout.trim().is_empty() {
+        return Ok(SyncOutcome::NoChanges);
+    }
+
+    let add_output = run_git(&sync.repo_path, &["add", "-A"], Vec::new())?;
+    if !add_output.status.success() {
+        return Err(anyhow!(format_git_error("git add", &add_output)));
+    }
+
+    let commit_message = sync_commit_message();
+    let commit_output = run_git(
+        &sync.repo_path,
+        &["commit", "-m", &commit_message],
+        Vec::new(),
+    )?;
+    if !commit_output.status.success() {
+        if is_nothing_to_commit(&commit_output) {
+            return Ok(SyncOutcome::NoChanges);
+        }
+        return Err(anyhow!(format_git_error("git commit", &commit_output)));
+    }
+
+    let branch = git_current_branch(&sync.repo_path)?;
+    if branch == "HEAD" {
+        return Err(anyhow!("Sync failed: detached HEAD."));
+    }
+
+    let askpass = create_askpass_script()?;
+    let askpass_path = askpass.path().to_string_lossy().to_string();
+    let push_env = vec![
+        ("GIT_TERMINAL_PROMPT", "0".to_string()),
+        ("GIT_ASKPASS", askpass_path),
+        ("GIT_SYNC_USERNAME", username),
+        ("GIT_SYNC_PAT", token),
+    ];
+    let push_output = run_git(
+        &sync.repo_path,
+        &["push", &remote, &format!("HEAD:refs/heads/{}", branch)],
+        push_env,
+    )?;
+    if !push_output.status.success() {
+        return Err(anyhow!(format_git_error("git push", &push_output)));
+    }
+
+    Ok(SyncOutcome::Pushed)
+}
+
+struct GitOutput {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_git(repo_path: &Path, args: &[&str], envs: Vec<(&str, String)>) -> Result<GitOutput> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(repo_path).args(args);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let output = cmd.output().context("run git command")?;
+    Ok(GitOutput {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+fn format_git_error(action: &str, output: &GitOutput) -> String {
+    let mut message = format!("{} failed.", action);
+    let stdout = output.stdout.trim();
+    let stderr = output.stderr.trim();
+    if !stdout.is_empty() {
+        message.push_str("\nstdout:\n");
+        message.push_str(stdout);
+    }
+    if !stderr.is_empty() {
+        message.push_str("\nstderr:\n");
+        message.push_str(stderr);
+    }
+    message
+}
+
+fn git_remote_names(repo_path: &Path) -> Result<Vec<String>> {
+    let output = run_git(repo_path, &["remote"], Vec::new())?;
+    if !output.status.success() {
+        return Err(anyhow!(format_git_error("git remote", &output)));
+    }
+    let names = output
+        .stdout
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    Ok(names)
+}
+
+fn git_remote_url(repo_path: &Path, remote: &str) -> Result<String> {
+    let output = run_git(repo_path, &["remote", "get-url", remote], Vec::new())?;
+    if !output.status.success() {
+        return Err(anyhow!(format_git_error("git remote get-url", &output)));
+    }
+    Ok(output.stdout.trim().to_string())
+}
+
+fn git_current_branch(repo_path: &Path) -> Result<String> {
+    let output = run_git(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"], Vec::new())?;
+    if !output.status.success() {
+        return Err(anyhow!(format_git_error("git rev-parse", &output)));
+    }
+    Ok(output.stdout.trim().to_string())
+}
+
+fn read_token_file(path: &Path) -> Result<String> {
+    let token = match fs::read_to_string(path) {
+        Ok(token) => token,
+        Err(_) => {
+            return Err(anyhow!("Sync requires PAT in settings.sync.token_file."));
+        }
+    };
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err(anyhow!("Sync requires PAT in settings.sync.token_file."));
+    }
+    Ok(token)
+}
+
+fn extract_https_username(remote_url: &str) -> Option<String> {
+    if !remote_url.starts_with("https://") {
+        return None;
+    }
+    let without_scheme = &remote_url["https://".len()..];
+    let slash_pos = without_scheme.find('/').unwrap_or(without_scheme.len());
+    let authority = &without_scheme[..slash_pos];
+    let userinfo = authority.split('@').next()?;
+    if !authority.contains('@') {
+        return None;
+    }
+    let username = userinfo.split(':').next().unwrap_or("");
+    if username.is_empty() {
+        None
+    } else {
+        Some(username.to_string())
+    }
+}
+
+fn is_nothing_to_commit(output: &GitOutput) -> bool {
+    let combined = format!("{}\n{}", output.stdout, output.stderr).to_lowercase();
+    combined.contains("nothing to commit")
+        || combined.contains("no changes added to commit")
+        || combined.contains("working tree clean")
+}
+
+fn sync_commit_message() -> String {
+    format!("Bot sync {}", Local::now().format("%Y-%m-%d %H:%M:%S"))
+}
+
+fn create_askpass_script() -> Result<NamedTempFile> {
+    let mut file = NamedTempFile::new().context("create askpass script")?;
+    file.write_all(
+        b"#!/bin/sh\ncase \"$1\" in\n*Username*) echo \"$GIT_SYNC_USERNAME\" ;;\n*Password*) echo \"$GIT_SYNC_PAT\" ;;\n*) echo \"\" ;;\nesac\n",
+    )
+    .context("write askpass script")?;
+    let mut perms = file.as_file().metadata()?.permissions();
+    perms.set_mode(0o700);
+    fs::set_permissions(file.path(), perms).context("chmod askpass script")?;
+    Ok(file)
 }
 
 fn split_items(text: &str) -> Vec<String> {
@@ -2956,5 +3225,27 @@ mod tests {
         assert!(is_instant_delete_message("DEL"));
         assert!(is_instant_delete_message("Delete"));
         assert!(!is_instant_delete_message("remove"));
+    }
+
+    #[test]
+    fn extract_https_username_from_remote() {
+        assert_eq!(
+            extract_https_username("https://user@host/repo.git"),
+            Some("user".to_string())
+        );
+        assert_eq!(
+            extract_https_username("https://user:pass@host/repo.git"),
+            Some("user".to_string())
+        );
+        assert_eq!(extract_https_username("https://host/repo.git"), None);
+        assert_eq!(extract_https_username("git@host:repo.git"), None);
+    }
+
+    #[test]
+    fn read_token_file_trims_whitespace() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"  token\n").unwrap();
+        let token = read_token_file(file.path()).unwrap();
+        assert_eq!(token, "token");
     }
 }
