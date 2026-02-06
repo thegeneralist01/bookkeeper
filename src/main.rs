@@ -359,7 +359,7 @@ async fn handle_message(
             .trim();
         match cmd {
             "start" | "help" => {
-                let help = "Send any text to save it. Use /add <text> to choose reading list or resources. Use /list to browse. Use /search <query> to find items. Use /undos to manage undo. Use /sync to push changes. Use --- to split a message into multiple items.";
+                let help = "Send any text to save it. Use /add <text> to choose reading list or resources. Use /list to browse. Use /search <query> to find items. Use /undos to manage undo. Use /pull, /pull theirs, /push, /sync. Use --- to split a message into multiple items.";
                 bot.send_message(msg.chat.id, help).await?;
                 return Ok(());
             }
@@ -392,6 +392,16 @@ async fn handle_message(
             }
             "undos" => {
                 handle_undos_command(bot.clone(), msg.clone(), state).await?;
+                let _ = bot.delete_message(msg.chat.id, msg.id).await;
+                return Ok(());
+            }
+            "pull" => {
+                handle_pull_command(bot.clone(), msg.clone(), state, rest).await?;
+                let _ = bot.delete_message(msg.chat.id, msg.id).await;
+                return Ok(());
+            }
+            "push" => {
+                handle_push_command(bot.clone(), msg.clone(), state).await?;
                 let _ = bot.delete_message(msg.chat.id, msg.id).await;
                 return Ok(());
             }
@@ -697,6 +707,85 @@ async fn handle_search_command(
     Ok(())
 }
 
+async fn handle_push_command(
+    bot: Bot,
+    msg: Message,
+    state: std::sync::Arc<AppState>,
+) -> Result<()> {
+    let Some(sync) = state.config.sync.clone() else {
+        send_error(
+            &bot,
+            msg.chat.id,
+            "Sync not configured. Set settings.sync.repo_path and settings.sync.token_file.",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let chat_id = msg.chat.id;
+    let outcome = tokio::task::spawn_blocking(move || run_push(&sync))
+        .await
+        .context("push task failed")?;
+
+    match outcome {
+        Ok(PushOutcome::NoChanges) => {
+            send_ephemeral(&bot, chat_id, "Nothing to sync.", ACK_TTL_SECS).await?;
+        }
+        Ok(PushOutcome::Pushed) => {
+            send_ephemeral(&bot, chat_id, "Synced.", ACK_TTL_SECS).await?;
+        }
+        Err(err) => {
+            send_error(&bot, chat_id, &err.to_string()).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_pull_command(
+    bot: Bot,
+    msg: Message,
+    state: std::sync::Arc<AppState>,
+    rest: &str,
+) -> Result<()> {
+    let Some(sync) = state.config.sync.clone() else {
+        send_error(
+            &bot,
+            msg.chat.id,
+            "Sync not configured. Set settings.sync.repo_path and settings.sync.token_file.",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let mode = match parse_pull_mode(rest) {
+        Ok(mode) => mode,
+        Err(message) => {
+            send_error(&bot, msg.chat.id, &message).await?;
+            return Ok(());
+        }
+    };
+
+    let chat_id = msg.chat.id;
+    let outcome = tokio::task::spawn_blocking(move || run_pull(&sync, mode))
+        .await
+        .context("pull task failed")?;
+
+    match outcome {
+        Ok(PullOutcome::UpToDate) => {
+            send_ephemeral(&bot, chat_id, "Already up to date.", ACK_TTL_SECS).await?;
+        }
+        Ok(PullOutcome::Pulled) => {
+            send_ephemeral(&bot, chat_id, "Pulled.", ACK_TTL_SECS).await?;
+        }
+        Err(err) => {
+            send_error(&bot, chat_id, &err.to_string()).await?;
+        }
+    }
+
+    Ok(())
+}
+
 async fn handle_sync_command(
     bot: Bot,
     msg: Message,
@@ -713,20 +802,39 @@ async fn handle_sync_command(
     };
 
     let chat_id = msg.chat.id;
-    let outcome = tokio::task::spawn_blocking(move || run_sync(&sync))
-        .await
-        .context("sync task failed")?;
+    let pull_result = tokio::task::spawn_blocking({
+        let sync = sync.clone();
+        move || run_pull(&sync, PullMode::FastForward)
+    })
+    .await
+    .context("pull task failed")?;
 
-    match outcome {
-        Ok(SyncOutcome::NoChanges) => {
-            send_ephemeral(&bot, chat_id, "Nothing to sync.", ACK_TTL_SECS).await?;
-        }
-        Ok(SyncOutcome::Pushed) => {
-            send_ephemeral(&bot, chat_id, "Synced.", ACK_TTL_SECS).await?;
-        }
+    let pull_outcome = match pull_result {
+        Ok(outcome) => outcome,
         Err(err) => {
             send_error(&bot, chat_id, &err.to_string()).await?;
+            return Ok(());
         }
+    };
+
+    let push_result = tokio::task::spawn_blocking(move || run_push(&sync))
+        .await
+        .context("push task failed")?;
+
+    let push_outcome = match push_result {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            send_error(&bot, chat_id, &err.to_string()).await?;
+            return Ok(());
+        }
+    };
+
+    let did_work = matches!(pull_outcome, PullOutcome::Pulled)
+        || matches!(push_outcome, PushOutcome::Pushed);
+    if did_work {
+        send_ephemeral(&bot, chat_id, "Synced.", ACK_TTL_SECS).await?;
+    } else {
+        send_ephemeral(&bot, chat_id, "Nothing to sync.", ACK_TTL_SECS).await?;
     }
 
     Ok(())
@@ -1860,9 +1968,19 @@ enum UserOpOutcome {
     Queued,
 }
 
-enum SyncOutcome {
+enum PushOutcome {
     NoChanges,
     Pushed,
+}
+
+enum PullOutcome {
+    UpToDate,
+    Pulled,
+}
+
+enum PullMode {
+    FastForward,
+    Theirs,
 }
 
 async fn queue_op(state: &std::sync::Arc<AppState>, op: QueuedOp) -> Result<()> {
@@ -1871,7 +1989,7 @@ async fn queue_op(state: &std::sync::Arc<AppState>, op: QueuedOp) -> Result<()> 
     save_queue(&state.queue_path, &queue)
 }
 
-fn run_sync(sync: &SyncConfig) -> Result<SyncOutcome> {
+fn run_push(sync: &SyncConfig) -> Result<PushOutcome> {
     ensure_git_available()?;
     if !sync.repo_path.exists() {
         return Err(anyhow!(
@@ -1918,7 +2036,7 @@ fn run_sync(sync: &SyncConfig) -> Result<SyncOutcome> {
         return Err(anyhow!(format_git_error("git status", &status_output)));
     }
     if status_output.stdout.trim().is_empty() {
-        return Ok(SyncOutcome::NoChanges);
+        return Ok(PushOutcome::NoChanges);
     }
 
     let add_output = run_git(&sync.repo_path, &["add", "-A"], Vec::new())?;
@@ -1934,7 +2052,7 @@ fn run_sync(sync: &SyncConfig) -> Result<SyncOutcome> {
     )?;
     if !commit_output.status.success() {
         if is_nothing_to_commit(&commit_output) {
-            return Ok(SyncOutcome::NoChanges);
+            return Ok(PushOutcome::NoChanges);
         }
         return Err(anyhow!(format_git_error("git commit", &commit_output)));
     }
@@ -1961,7 +2079,103 @@ fn run_sync(sync: &SyncConfig) -> Result<SyncOutcome> {
         return Err(anyhow!(format_git_error("git push", &push_output)));
     }
 
-    Ok(SyncOutcome::Pushed)
+    Ok(PushOutcome::Pushed)
+}
+
+fn run_pull(sync: &SyncConfig, mode: PullMode) -> Result<PullOutcome> {
+    ensure_git_available()?;
+    if !sync.repo_path.exists() {
+        return Err(anyhow!(
+            "Sync repo path not found: {}",
+            sync.repo_path.display()
+        ));
+    }
+
+    let repo_check = run_git(
+        &sync.repo_path,
+        &["rev-parse", "--is-inside-work-tree"],
+        Vec::new(),
+    )?;
+    if !repo_check.status.success() || repo_check.stdout.trim() != "true" {
+        return Err(anyhow!(
+            "Sync repo path not found or not a git repository: {}",
+            sync.repo_path.display()
+        ));
+    }
+
+    let token = read_token_file(&sync.token_file)?;
+
+    let remotes = git_remote_names(&sync.repo_path)?;
+    let remote = if remotes.iter().any(|name| name == "origin") {
+        "origin".to_string()
+    } else {
+        remotes
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("Git remote not configured."))?
+    };
+    let remote_url = git_remote_url(&sync.repo_path, &remote)?;
+    if !remote_url.starts_with("https://") {
+        return Err(anyhow!(
+            "Sync requires HTTPS remote for PAT auth. Remote is {}",
+            remote_url
+        ));
+    }
+
+    let username =
+        extract_https_username(&remote_url).unwrap_or_else(|| "x-access-token".to_string());
+
+    let status_output = run_git(&sync.repo_path, &["status", "--porcelain"], Vec::new())?;
+    if !status_output.status.success() {
+        return Err(anyhow!(format_git_error("git status", &status_output)));
+    }
+    if !status_output.stdout.trim().is_empty() {
+        return Err(anyhow!(
+            "Working tree has uncommitted changes; commit or stash before pull."
+        ));
+    }
+
+    let branch = git_current_branch(&sync.repo_path)?;
+    if branch == "HEAD" {
+        return Err(anyhow!("Sync failed: detached HEAD."));
+    }
+
+    let askpass = create_askpass_script()?;
+    let askpass_path = askpass.to_string_lossy().to_string();
+    let pull_env = vec![
+        ("GIT_TERMINAL_PROMPT", "0".to_string()),
+        ("GIT_ASKPASS", askpass_path),
+        ("GIT_SYNC_USERNAME", username),
+        ("GIT_SYNC_PAT", token),
+    ];
+
+    let pull_args: Vec<String> = match mode {
+        PullMode::FastForward => vec![
+            "pull".to_string(),
+            "--ff-only".to_string(),
+            remote,
+            branch,
+        ],
+        PullMode::Theirs => vec![
+            "pull".to_string(),
+            "--no-edit".to_string(),
+            "-X".to_string(),
+            "theirs".to_string(),
+            remote,
+            branch,
+        ],
+    };
+    let pull_args_ref: Vec<&str> = pull_args.iter().map(|arg| arg.as_str()).collect();
+    let pull_output = run_git(&sync.repo_path, &pull_args_ref, pull_env)?;
+    if !pull_output.status.success() {
+        return Err(anyhow!(format_git_error("git pull", &pull_output)));
+    }
+
+    if is_already_up_to_date(&pull_output) {
+        Ok(PullOutcome::UpToDate)
+    } else {
+        Ok(PullOutcome::Pulled)
+    }
 }
 
 struct GitOutput {
@@ -2084,6 +2298,22 @@ fn is_nothing_to_commit(output: &GitOutput) -> bool {
     combined.contains("nothing to commit")
         || combined.contains("no changes added to commit")
         || combined.contains("working tree clean")
+}
+
+fn is_already_up_to_date(output: &GitOutput) -> bool {
+    let combined = format!("{}\n{}", output.stdout, output.stderr).to_lowercase();
+    combined.contains("already up to date") || combined.contains("already up-to-date")
+}
+
+fn parse_pull_mode(rest: &str) -> std::result::Result<PullMode, String> {
+    let option = rest.trim();
+    if option.is_empty() {
+        return Ok(PullMode::FastForward);
+    }
+    if option.eq_ignore_ascii_case("theirs") {
+        return Ok(PullMode::Theirs);
+    }
+    Err("Unknown pull option. Use /pull or /pull theirs.".to_string())
 }
 
 fn sync_commit_message() -> String {
@@ -3083,6 +3313,7 @@ async fn process_queue(state: std::sync::Arc<AppState>) -> Result<()> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::os::unix::process::ExitStatusExt;
 
     fn entry(text: &str) -> EntryBlock {
         EntryBlock::from_text(text)
@@ -3265,5 +3496,25 @@ mod tests {
         file.write_all(b"  token\n").unwrap();
         let token = read_token_file(file.path()).unwrap();
         assert_eq!(token, "token");
+    }
+
+    #[test]
+    fn parse_pull_mode_accepts_theirs() {
+        assert!(matches!(parse_pull_mode(""), Ok(PullMode::FastForward)));
+        assert!(matches!(
+            parse_pull_mode("theirs"),
+            Ok(PullMode::Theirs)
+        ));
+        assert!(parse_pull_mode("unknown").is_err());
+    }
+
+    #[test]
+    fn is_already_up_to_date_detects_output() {
+        let output = GitOutput {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: "Already up to date.".to_string(),
+            stderr: String::new(),
+        };
+        assert!(is_already_up_to_date(&output));
     }
 }
