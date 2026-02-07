@@ -802,39 +802,20 @@ async fn handle_sync_command(
     };
 
     let chat_id = msg.chat.id;
-    let pull_result = tokio::task::spawn_blocking({
-        let sync = sync.clone();
-        move || run_pull(&sync, PullMode::FastForward)
-    })
-    .await
-    .context("pull task failed")?;
-
-    let pull_outcome = match pull_result {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            send_error(&bot, chat_id, &err.to_string()).await?;
-            return Ok(());
-        }
-    };
-
-    let push_result = tokio::task::spawn_blocking(move || run_push(&sync))
+    let outcome = tokio::task::spawn_blocking(move || run_sync(&sync))
         .await
-        .context("push task failed")?;
+        .context("sync task failed")?;
 
-    let push_outcome = match push_result {
-        Ok(outcome) => outcome,
+    match outcome {
+        Ok(SyncOutcome::Synced) => {
+            send_ephemeral(&bot, chat_id, "Synced.", ACK_TTL_SECS).await?;
+        }
+        Ok(SyncOutcome::NoChanges) => {
+            send_ephemeral(&bot, chat_id, "Nothing to sync.", ACK_TTL_SECS).await?;
+        }
         Err(err) => {
             send_error(&bot, chat_id, &err.to_string()).await?;
-            return Ok(());
         }
-    };
-
-    let did_work = matches!(pull_outcome, PullOutcome::Pulled)
-        || matches!(push_outcome, PushOutcome::Pushed);
-    if did_work {
-        send_ephemeral(&bot, chat_id, "Synced.", ACK_TTL_SECS).await?;
-    } else {
-        send_ephemeral(&bot, chat_id, "Nothing to sync.", ACK_TTL_SECS).await?;
     }
 
     Ok(())
@@ -1983,6 +1964,11 @@ enum PullMode {
     Theirs,
 }
 
+enum SyncOutcome {
+    NoChanges,
+    Synced,
+}
+
 async fn queue_op(state: &std::sync::Arc<AppState>, op: QueuedOp) -> Result<()> {
     let mut queue = state.queue.lock().await;
     queue.push(op);
@@ -2178,6 +2164,114 @@ fn run_pull(sync: &SyncConfig, mode: PullMode) -> Result<PullOutcome> {
     }
 }
 
+fn run_sync(sync: &SyncConfig) -> Result<SyncOutcome> {
+    ensure_git_available()?;
+    if !sync.repo_path.exists() {
+        return Err(anyhow!(
+            "Sync repo path not found: {}",
+            sync.repo_path.display()
+        ));
+    }
+
+    let repo_check = run_git(
+        &sync.repo_path,
+        &["rev-parse", "--is-inside-work-tree"],
+        Vec::new(),
+    )?;
+    if !repo_check.status.success() || repo_check.stdout.trim() != "true" {
+        return Err(anyhow!(
+            "Sync repo path not found or not a git repository: {}",
+            sync.repo_path.display()
+        ));
+    }
+
+    let token = read_token_file(&sync.token_file)?;
+
+    let remotes = git_remote_names(&sync.repo_path)?;
+    let remote = if remotes.iter().any(|name| name == "origin") {
+        "origin".to_string()
+    } else {
+        remotes
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("Git remote not configured."))?
+    };
+    let remote_url = git_remote_url(&sync.repo_path, &remote)?;
+    if !remote_url.starts_with("https://") {
+        return Err(anyhow!(
+            "Sync requires HTTPS remote for PAT auth. Remote is {}",
+            remote_url
+        ));
+    }
+
+    let username =
+        extract_https_username(&remote_url).unwrap_or_else(|| "x-access-token".to_string());
+
+    let status_output = run_git(&sync.repo_path, &["status", "--porcelain"], Vec::new())?;
+    if !status_output.status.success() {
+        return Err(anyhow!(format_git_error("git status", &status_output)));
+    }
+
+    let add_output = run_git(&sync.repo_path, &["add", "-A"], Vec::new())?;
+    if !add_output.status.success() {
+        return Err(anyhow!(format_git_error("git add", &add_output)));
+    }
+
+    let commit_message = sync_commit_message();
+    let commit_output = run_git(
+        &sync.repo_path,
+        &["commit", "-m", &commit_message],
+        Vec::new(),
+    )?;
+    let did_commit = if commit_output.status.success() {
+        true
+    } else if is_nothing_to_commit(&commit_output) {
+        false
+    } else {
+        return Err(anyhow!(format_git_error("git commit", &commit_output)));
+    };
+
+    let branch = git_current_branch(&sync.repo_path)?;
+    if branch == "HEAD" {
+        return Err(anyhow!("Sync failed: detached HEAD."));
+    }
+
+    let askpass = create_askpass_script()?;
+    let askpass_path = askpass.to_string_lossy().to_string();
+    let auth_env = vec![
+        ("GIT_TERMINAL_PROMPT", "0".to_string()),
+        ("GIT_ASKPASS", askpass_path),
+        ("GIT_SYNC_USERNAME", username),
+        ("GIT_SYNC_PAT", token),
+    ];
+
+    let pull_output = run_git(
+        &sync.repo_path,
+        &["pull", "--ff-only", &remote, &branch],
+        auth_env.clone(),
+    )?;
+    if !pull_output.status.success() {
+        return Err(anyhow!(format_git_error("git pull", &pull_output)));
+    }
+    let did_pull = !is_already_up_to_date(&pull_output);
+
+    let push_output = run_git(
+        &sync.repo_path,
+        &["push", &remote, &format!("HEAD:refs/heads/{}", branch)],
+        auth_env,
+    )?;
+    if !push_output.status.success() {
+        return Err(anyhow!(format_git_error("git push", &push_output)));
+    }
+    let did_push = !is_push_up_to_date(&push_output);
+
+    if did_commit || did_pull || did_push {
+        Ok(SyncOutcome::Synced)
+    } else {
+        Ok(SyncOutcome::NoChanges)
+    }
+}
+
 struct GitOutput {
     status: std::process::ExitStatus,
     stdout: String,
@@ -2303,6 +2397,11 @@ fn is_nothing_to_commit(output: &GitOutput) -> bool {
 fn is_already_up_to_date(output: &GitOutput) -> bool {
     let combined = format!("{}\n{}", output.stdout, output.stderr).to_lowercase();
     combined.contains("already up to date") || combined.contains("already up-to-date")
+}
+
+fn is_push_up_to_date(output: &GitOutput) -> bool {
+    let combined = format!("{}\n{}", output.stdout, output.stderr).to_lowercase();
+    combined.contains("everything up-to-date") || combined.contains("everything up to date")
 }
 
 fn parse_pull_mode(rest: &str) -> std::result::Result<PullMode, String> {
@@ -3516,5 +3615,15 @@ mod tests {
             stderr: String::new(),
         };
         assert!(is_already_up_to_date(&output));
+    }
+
+    #[test]
+    fn is_push_up_to_date_detects_output() {
+        let output = GitOutput {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: "Everything up-to-date".to_string(),
+            stderr: String::new(),
+        };
+        assert!(is_push_up_to_date(&output));
     }
 }
