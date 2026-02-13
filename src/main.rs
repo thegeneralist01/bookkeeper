@@ -24,7 +24,7 @@ const DELETE_CONFIRM_TTL_SECS: u64 = 5 * 60;
 const RESOURCE_PROMPT_TTL_SECS: u64 = 5 * 60;
 const PAGE_SIZE: usize = 3;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 struct Config {
     token: String,
     user_id: u64,
@@ -34,6 +34,26 @@ struct Config {
     data_dir: PathBuf,
     retry_interval_seconds: Option<u64>,
     sync: Option<SyncConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ConfigFile {
+    token: String,
+    user_id: UserIdInput,
+    read_later_path: PathBuf,
+    finished_path: PathBuf,
+    resources_path: PathBuf,
+    data_dir: PathBuf,
+    retry_interval_seconds: Option<u64>,
+    sync: Option<SyncConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+enum UserIdInput {
+    Number(u64),
+    String(String),
+    File { file: PathBuf },
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -3059,10 +3079,67 @@ where
     Err(last_err.unwrap_or_else(|| anyhow!("retry failed")))
 }
 
+fn resolve_user_id(input: UserIdInput, config_dir: &Path) -> Result<u64> {
+    match input {
+        UserIdInput::Number(value) => Ok(value),
+        UserIdInput::String(raw) => resolve_user_id_string(&raw, config_dir),
+        UserIdInput::File { file } => {
+            let path = resolve_user_id_path(&file, config_dir);
+            read_user_id_file(&path)
+        }
+    }
+}
+
+fn resolve_user_id_string(raw: &str, config_dir: &Path) -> Result<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("user_id is empty"));
+    }
+    if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return parse_user_id_value(trimmed).context("parse user_id");
+    }
+    let path = resolve_user_id_path(Path::new(trimmed), config_dir);
+    read_user_id_file(&path)
+}
+
+fn resolve_user_id_path(path: &Path, config_dir: &Path) -> PathBuf {
+    if path.is_relative() {
+        config_dir.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn read_user_id_file(path: &Path) -> Result<u64> {
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("read user_id file {}", path.display()))?;
+    parse_user_id_value(contents.trim())
+        .with_context(|| format!("parse user_id from {}", path.display()))
+}
+
+fn parse_user_id_value(raw: &str) -> Result<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("user_id is empty"));
+    }
+    trimmed.parse::<u64>().context("parse user_id")
+}
+
 fn load_config(path: &Path) -> Result<Config> {
     let contents = fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
-    let config: Config = toml::from_str(&contents).context("parse config")?;
-    Ok(config)
+    let config_file: ConfigFile = toml::from_str(&contents).context("parse config")?;
+    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let user_id = resolve_user_id(config_file.user_id, config_dir)?;
+    Ok(Config {
+        token: config_file.token,
+        user_id,
+        read_later_path: config_file.read_later_path,
+        finished_path: config_file.finished_path,
+        resources_path: config_file.resources_path,
+        data_dir: config_file.data_dir,
+        retry_interval_seconds: config_file.retry_interval_seconds,
+        sync: config_file.sync,
+    })
 }
 
 fn list_resource_files(dir: &Path) -> Result<Vec<PathBuf>> {
