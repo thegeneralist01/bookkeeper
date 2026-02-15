@@ -43,7 +43,12 @@
             data_dir = "/var/lib/readlater-bot";
             retry_interval_seconds = 30;
           };
-          mergedSettings = defaultSettings // cfg.settings;
+          mergedSettings =
+            defaultSettings
+            // cfg.settings
+            // lib.optionalAttrs (cfg.mediaDir != null) {
+              media_dir = cfg.mediaDir;
+            };
           settingsFile = tomlFormat.generate "readlater-bot.toml" mergedSettings;
           runtimeConfig = "/run/readlater-bot/config.toml";
           useRuntimeConfig = cfg.configFile == null;
@@ -82,6 +87,11 @@
               default = "readlater-bot";
               description = "Group for the bot service.";
             };
+            mediaDir = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "Directory for storing media downloads (images/videos).";
+            };
           };
 
           config = lib.mkIf cfg.enable {
@@ -118,6 +128,7 @@
               path = [
                 pkgs.git
                 pkgs.openssh
+                pkgs.yt-dlp
               ];
               preStart = lib.optionalString useRuntimeConfig ''
                 umask 0077

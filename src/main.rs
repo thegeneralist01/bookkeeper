@@ -12,10 +12,11 @@ use clap::Parser;
 use log::error;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
+use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageId};
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, MessageId};
 use tokio::sync::Mutex;
-use tempfile::{NamedTempFile, TempPath};
+use tempfile::{NamedTempFile, TempDir, TempPath};
 use uuid::Uuid;
 
 const ACK_TTL_SECS: u64 = 5;
@@ -23,6 +24,8 @@ const UNDO_TTL_SECS: u64 = 30 * 60;
 const DELETE_CONFIRM_TTL_SECS: u64 = 5 * 60;
 const RESOURCE_PROMPT_TTL_SECS: u64 = 5 * 60;
 const PAGE_SIZE: usize = 3;
+const DOWNLOAD_PROMPT_TTL_SECS: u64 = 5 * 60;
+const FINISH_TITLE_PROMPT_TTL_SECS: u64 = 5 * 60;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -31,6 +34,7 @@ struct Config {
     read_later_path: PathBuf,
     finished_path: PathBuf,
     resources_path: PathBuf,
+    media_dir: PathBuf,
     data_dir: PathBuf,
     retry_interval_seconds: Option<u64>,
     sync: Option<SyncConfig>,
@@ -43,6 +47,7 @@ struct ConfigFile {
     read_later_path: PathBuf,
     finished_path: PathBuf,
     resources_path: PathBuf,
+    media_dir: Option<PathBuf>,
     data_dir: PathBuf,
     retry_interval_seconds: Option<u64>,
     sync: Option<SyncConfig>,
@@ -150,6 +155,7 @@ enum QueuedOpKind {
     AddResource,
     Delete,
     MoveToFinished,
+    MoveToFinishedUpdated,
     MoveToReadLater,
     UpdateEntry,
 }
@@ -204,6 +210,31 @@ struct ResourceFilenamePrompt {
 }
 
 #[derive(Clone, Debug)]
+struct DownloadPickerState {
+    chat_id: i64,
+    message_id: MessageId,
+    links: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DownloadLinkPrompt {
+    links: Vec<String>,
+    prompt_message_id: MessageId,
+    expires_at: u64,
+}
+
+#[derive(Clone, Debug)]
+struct FinishTitlePrompt {
+    session_id: String,
+    chat_id: i64,
+    entry: String,
+    link: String,
+    return_to: ListView,
+    prompt_message_id: MessageId,
+    expires_at: u64,
+}
+
+#[derive(Clone, Debug)]
 struct UndoSession {
     chat_id: i64,
     message_id: MessageId,
@@ -219,6 +250,7 @@ enum SessionKind {
 #[derive(Clone, Debug)]
 struct ListSession {
     id: String,
+    chat_id: i64,
     kind: SessionKind,
     entries: Vec<EntryBlock>,
     view: ListView,
@@ -231,6 +263,10 @@ enum ListView {
     Menu,
     Peek { mode: ListMode, page: usize },
     Selected { return_to: Box<ListView>, index: usize },
+    FinishConfirm {
+        selected: Box<ListView>,
+        index: usize,
+    },
     DeleteConfirm {
         selected: Box<ListView>,
         index: usize,
@@ -248,13 +284,17 @@ enum ListMode {
 struct AppState {
     config: Config,
     write_lock: Mutex<()>,
-    sessions: Mutex<HashMap<i64, ListSession>>,
+    sessions: Mutex<HashMap<String, ListSession>>,
+    active_sessions: Mutex<HashMap<i64, String>>,
     peeked: Mutex<HashSet<String>>,
     undo_sessions: Mutex<HashMap<String, UndoSession>>,
     pickers: Mutex<HashMap<String, PickerState>>,
     add_prompts: Mutex<HashMap<String, AddPrompt>>,
     resource_pickers: Mutex<HashMap<String, ResourcePickerState>>,
     resource_filename_prompts: Mutex<HashMap<i64, ResourceFilenamePrompt>>,
+    download_pickers: Mutex<HashMap<String, DownloadPickerState>>,
+    download_link_prompts: Mutex<HashMap<i64, DownloadLinkPrompt>>,
+    finish_title_prompts: Mutex<HashMap<i64, FinishTitlePrompt>>,
     queue: Mutex<Vec<QueuedOp>>,
     undo: Mutex<Vec<UndoRecord>>,
     queue_path: PathBuf,
@@ -292,12 +332,16 @@ async fn main() -> Result<()> {
         config: config.clone(),
         write_lock: Mutex::new(()),
         sessions: Mutex::new(HashMap::new()),
+        active_sessions: Mutex::new(HashMap::new()),
         peeked: Mutex::new(HashSet::new()),
         undo_sessions: Mutex::new(HashMap::new()),
         pickers: Mutex::new(HashMap::new()),
         add_prompts: Mutex::new(HashMap::new()),
         resource_pickers: Mutex::new(HashMap::new()),
         resource_filename_prompts: Mutex::new(HashMap::new()),
+        download_pickers: Mutex::new(HashMap::new()),
+        download_link_prompts: Mutex::new(HashMap::new()),
+        finish_title_prompts: Mutex::new(HashMap::new()),
         queue: Mutex::new(load_queue(&queue_path)?),
         undo: Mutex::new(undo),
         queue_path,
@@ -339,19 +383,23 @@ async fn handle_message(
         return Ok(());
     }
 
+    if handle_media_message(&bot, &msg, &state).await? {
+        return Ok(());
+    }
+
     let text = match msg.text() {
         Some(text) => text.to_string(),
         None => return Ok(()),
     };
 
-    let mut expired_prompt: Option<ResourceFilenamePrompt> = None;
-    let pending_prompt = {
-        let mut prompts = state.resource_filename_prompts.lock().await;
+    let mut expired_finish_prompt: Option<FinishTitlePrompt> = None;
+    let pending_finish_prompt = {
+        let mut prompts = state.finish_title_prompts.lock().await;
         if let Some(prompt) = prompts.remove(&msg.chat.id.0) {
             if prompt.expires_at > now_ts() {
                 Some(prompt)
             } else {
-                expired_prompt = Some(prompt);
+                expired_finish_prompt = Some(prompt);
                 None
             }
         } else {
@@ -359,15 +407,67 @@ async fn handle_message(
         }
     };
 
-    if let Some(prompt) = expired_prompt {
+    if let Some(prompt) = expired_finish_prompt {
         let _ = bot
             .delete_message(msg.chat.id, prompt.prompt_message_id)
             .await;
     }
 
-    if let Some(prompt) = pending_prompt {
+    if let Some(prompt) = pending_finish_prompt {
+        handle_finish_title_response(&bot, msg.chat.id, msg.id, &state, &text, prompt).await?;
+        return Ok(());
+    }
+
+    let mut expired_resource_prompt: Option<ResourceFilenamePrompt> = None;
+    let pending_resource_prompt = {
+        let mut prompts = state.resource_filename_prompts.lock().await;
+        if let Some(prompt) = prompts.remove(&msg.chat.id.0) {
+            if prompt.expires_at > now_ts() {
+                Some(prompt)
+            } else {
+                expired_resource_prompt = Some(prompt);
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    if let Some(prompt) = expired_resource_prompt {
+        let _ = bot
+            .delete_message(msg.chat.id, prompt.prompt_message_id)
+            .await;
+    }
+
+    if let Some(prompt) = pending_resource_prompt {
         handle_resource_filename_response(&bot, msg.chat.id, msg.id, &state, &text, prompt)
             .await?;
+        return Ok(());
+    }
+
+    let mut expired_download_prompt: Option<DownloadLinkPrompt> = None;
+    let pending_download_prompt = {
+        let mut prompts = state.download_link_prompts.lock().await;
+        if let Some(prompt) = prompts.remove(&msg.chat.id.0) {
+            if prompt.expires_at > now_ts() {
+                Some(prompt)
+            } else {
+                expired_download_prompt = Some(prompt);
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    if let Some(prompt) = expired_download_prompt {
+        let _ = bot
+            .delete_message(msg.chat.id, prompt.prompt_message_id)
+            .await;
+    }
+
+    if let Some(prompt) = pending_download_prompt {
+        handle_download_link_response(&bot, msg.chat.id, msg.id, &state, &text, prompt).await?;
         return Ok(());
     }
 
@@ -379,7 +479,7 @@ async fn handle_message(
             .trim();
         match cmd {
             "start" | "help" => {
-                let help = "Send any text to save it. Use /add <text> to choose reading list or resources. Use /list to browse. Use /search <query> to find items. Use /undos to manage undo. Use /pull, /pull theirs, /push, /sync. Use --- to split a message into multiple items.";
+                let help = "Send any text to save it. Commands: /add <text>, /list, /search <query>, /download [url], /undos, /reset_peeked, /pull, /pull theirs, /push, /sync. Use --- to split a message into multiple items. In list views, use buttons for Mark Finished, Add Resource, Delete, Random. Quick actions: reply with del/delete to remove the current item, or send norm to normalize links.";
                 bot.send_message(msg.chat.id, help).await?;
                 return Ok(());
             }
@@ -402,6 +502,11 @@ async fn handle_message(
                 } else {
                     handle_search_command(bot.clone(), msg.clone(), state, rest).await?;
                 }
+                let _ = bot.delete_message(msg.chat.id, msg.id).await;
+                return Ok(());
+            }
+            "download" => {
+                handle_download_command(bot.clone(), msg.clone(), state, rest).await?;
                 let _ = bot.delete_message(msg.chat.id, msg.id).await;
                 return Ok(());
             }
@@ -457,25 +562,116 @@ async fn handle_message(
     Ok(())
 }
 
+async fn handle_media_message(
+    bot: &Bot,
+    msg: &Message,
+    state: &std::sync::Arc<AppState>,
+) -> Result<bool> {
+    let chat_id = msg.chat.id;
+    let caption = msg.caption().map(|text| text.to_string());
+    let media_dir = state.config.media_dir.clone();
+
+    if let Some(photos) = msg.photo() {
+        if let Some(photo) = pick_best_photo(photos) {
+            fs::create_dir_all(&media_dir)
+                .with_context(|| format!("create media dir {}", media_dir.display()))?;
+            let filename = format!("image-{}.jpg", Uuid::new_v4());
+            let dest_path = media_dir.join(&filename);
+            download_telegram_file(bot, &photo.file.id, &dest_path).await?;
+            let entry_text = build_media_entry_text(&filename, caption.as_deref());
+            handle_single_item(bot.clone(), chat_id, state.clone(), &entry_text, Some(msg.id)).await?;
+            return Ok(true);
+        }
+    }
+
+    if let Some(document) = msg.document() {
+        let mime = document.mime_type.as_ref().map(|m| m.essence_str());
+        let is_media = if let Some(mime) = mime {
+            mime.starts_with("image/") || mime.starts_with("video/")
+        } else {
+            document
+                .file_name
+                .as_deref()
+                .and_then(|name| Path::new(name).extension().and_then(|ext| ext.to_str()))
+                .map(|ext| matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "mp4" | "mov" | "mkv"
+                ))
+                .unwrap_or(false)
+        };
+        if is_media {
+            fs::create_dir_all(&media_dir)
+                .with_context(|| format!("create media dir {}", media_dir.display()))?;
+            let ext = mime.and_then(extension_from_mime);
+            let filename = if let Some(name) = document.file_name.as_deref() {
+                sanitize_filename_with_default(name, ext)
+            } else {
+                format!("file-{}.{}", Uuid::new_v4(), ext.unwrap_or("bin"))
+            };
+            let dest_path = media_dir.join(&filename);
+            download_telegram_file(bot, &document.file.id, &dest_path).await?;
+            let entry_text = build_media_entry_text(&filename, caption.as_deref());
+            handle_single_item(bot.clone(), chat_id, state.clone(), &entry_text, Some(msg.id)).await?;
+            return Ok(true);
+        }
+    }
+
+    if let Some(video) = msg.video() {
+        fs::create_dir_all(&media_dir)
+            .with_context(|| format!("create media dir {}", media_dir.display()))?;
+        let ext = video
+            .mime_type
+            .as_ref()
+            .map(|m| m.essence_str())
+            .and_then(extension_from_mime);
+        let filename = if let Some(name) = video.file_name.as_deref() {
+            sanitize_filename_with_default(name, ext)
+        } else {
+            format!("video-{}.{}", Uuid::new_v4(), ext.unwrap_or("mp4"))
+        };
+        let dest_path = media_dir.join(&filename);
+        download_telegram_file(bot, &video.file.id, &dest_path).await?;
+        let entry_text = build_media_entry_text(&filename, caption.as_deref());
+        handle_single_item(bot.clone(), chat_id, state.clone(), &entry_text, Some(msg.id)).await?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 async fn handle_norm_message(
     bot: &Bot,
     msg: &Message,
     state: &std::sync::Arc<AppState>,
 ) -> Result<bool> {
     let chat_id = msg.chat.id;
+    let session_id = {
+        let active = state.active_sessions.lock().await;
+        active.get(&chat_id.0).cloned()
+    };
+    let Some(session_id) = session_id else {
+        return Ok(false);
+    };
     let mut session = {
         let mut sessions = state.sessions.lock().await;
-        match sessions.remove(&chat_id.0) {
+        match sessions.remove(&session_id) {
             Some(session) => session,
             None => return Ok(false),
         }
     };
+    if session.chat_id != chat_id.0 {
+        state.sessions.lock().await.insert(session_id, session);
+        return Ok(false);
+    }
 
     let peeked_snapshot = state.peeked.lock().await.clone();
     let target_index = match norm_target_index(&session, &peeked_snapshot) {
         Some(index) => index,
         None => {
-            state.sessions.lock().await.insert(chat_id.0, session);
+            state.sessions
+                .lock()
+                .await
+                .insert(session.id.clone(), session);
             let _ = bot.delete_message(chat_id, msg.id).await;
             send_ephemeral(bot, chat_id, "Couldn't normalize.", ACK_TTL_SECS).await?;
             return Ok(true);
@@ -485,7 +681,10 @@ async fn handle_norm_message(
     let entry = match session.entries.get(target_index).cloned() {
         Some(entry) => entry,
         None => {
-            state.sessions.lock().await.insert(chat_id.0, session);
+            state.sessions
+                .lock()
+                .await
+                .insert(session.id.clone(), session);
             let _ = bot.delete_message(chat_id, msg.id).await;
             send_ephemeral(bot, chat_id, "Couldn't normalize.", ACK_TTL_SECS).await?;
             return Ok(true);
@@ -493,7 +692,10 @@ async fn handle_norm_message(
     };
 
     let Some(normalized_entry) = normalize_entry_markdown_links(&entry) else {
-        state.sessions.lock().await.insert(chat_id.0, session);
+        state.sessions
+            .lock()
+            .await
+            .insert(session.id.clone(), session);
         let _ = bot.delete_message(chat_id, msg.id).await;
         send_ephemeral(bot, chat_id, "Couldn't normalize.", ACK_TTL_SECS).await?;
         return Ok(true);
@@ -528,7 +730,10 @@ async fn handle_norm_message(
         }
     }
 
-    state.sessions.lock().await.insert(chat_id.0, session);
+    state.sessions
+        .lock()
+        .await
+        .insert(session.id.clone(), session);
     let _ = bot.delete_message(chat_id, msg.id).await;
     Ok(true)
 }
@@ -539,19 +744,33 @@ async fn handle_instant_delete_message(
     state: &std::sync::Arc<AppState>,
 ) -> Result<bool> {
     let chat_id = msg.chat.id;
+    let session_id = {
+        let active = state.active_sessions.lock().await;
+        active.get(&chat_id.0).cloned()
+    };
+    let Some(session_id) = session_id else {
+        return Ok(false);
+    };
     let mut session = {
         let mut sessions = state.sessions.lock().await;
-        match sessions.remove(&chat_id.0) {
+        match sessions.remove(&session_id) {
             Some(session) => session,
             None => return Ok(false),
         }
     };
+    if session.chat_id != chat_id.0 {
+        state.sessions.lock().await.insert(session_id, session);
+        return Ok(false);
+    }
 
     let peeked_snapshot = state.peeked.lock().await.clone();
     let target_index = match norm_target_index(&session, &peeked_snapshot) {
         Some(index) => index,
         None => {
-            state.sessions.lock().await.insert(chat_id.0, session);
+            state.sessions
+                .lock()
+                .await
+                .insert(session.id.clone(), session);
             let _ = bot.delete_message(chat_id, msg.id).await;
             send_ephemeral(bot, chat_id, "Couldn't delete.", ACK_TTL_SECS).await?;
             return Ok(true);
@@ -561,7 +780,10 @@ async fn handle_instant_delete_message(
     let entry_block = match session.entries.get(target_index).map(|e| e.block_string()) {
         Some(entry) => entry,
         None => {
-            state.sessions.lock().await.insert(chat_id.0, session);
+            state.sessions
+                .lock()
+                .await
+                .insert(session.id.clone(), session);
             let _ = bot.delete_message(chat_id, msg.id).await;
             send_ephemeral(bot, chat_id, "Couldn't delete.", ACK_TTL_SECS).await?;
             return Ok(true);
@@ -602,7 +824,10 @@ async fn handle_instant_delete_message(
         }
     }
 
-    state.sessions.lock().await.insert(chat_id.0, session);
+    state.sessions
+        .lock()
+        .await
+        .insert(session.id.clone(), session);
     let _ = bot.delete_message(chat_id, msg.id).await;
     Ok(true)
 }
@@ -634,6 +859,10 @@ async fn handle_callback(
             handle_add_callback(bot, q, state).await?;
         } else if data.starts_with("res:") {
             handle_resource_callback(bot, q, state).await?;
+        } else if data.starts_with("dl:") {
+            handle_download_callback(bot, q, state).await?;
+        } else if data.starts_with("msgdel") {
+            handle_message_delete_callback(bot, q).await?;
         } else if data.starts_with("undos:") {
             handle_undos_callback(bot, q, state).await?;
         } else if data.starts_with("undo:") {
@@ -653,6 +882,7 @@ async fn handle_list_command(
     let session_id = short_id();
     let mut session = ListSession {
         id: session_id.clone(),
+        chat_id: msg.chat.id.0,
         kind: SessionKind::List,
         entries,
         view: ListView::Menu,
@@ -670,7 +900,12 @@ async fn handle_list_command(
         .sessions
         .lock()
         .await
-        .insert(msg.chat.id.0, session);
+        .insert(session_id.clone(), session);
+    state
+        .active_sessions
+        .lock()
+        .await
+        .insert(msg.chat.id.0, session_id);
     Ok(())
 }
 
@@ -691,6 +926,7 @@ async fn handle_search_command(
     let session_id = short_id();
     let mut session = ListSession {
         id: session_id.clone(),
+        chat_id: msg.chat.id.0,
         kind: SessionKind::Search {
             query: query.to_string(),
         },
@@ -723,8 +959,65 @@ async fn handle_search_command(
         .sessions
         .lock()
         .await
-        .insert(msg.chat.id.0, session);
+        .insert(session_id.clone(), session);
+    state
+        .active_sessions
+        .lock()
+        .await
+        .insert(msg.chat.id.0, session_id);
     Ok(())
+}
+
+async fn handle_download_command(
+    bot: Bot,
+    msg: Message,
+    state: std::sync::Arc<AppState>,
+    rest: &str,
+) -> Result<()> {
+    let links = if !rest.trim().is_empty() {
+        extract_links(rest)
+    } else {
+        match active_entry_text(&state, msg.chat.id.0).await {
+            Some(text) => extract_links(&text),
+            None => Vec::new(),
+        }
+    };
+
+    start_download_picker(&bot, msg.chat.id, &state, links).await?;
+    Ok(())
+}
+
+async fn active_entry_text(state: &std::sync::Arc<AppState>, chat_id: i64) -> Option<String> {
+    let session_id = {
+        let active = state.active_sessions.lock().await;
+        active.get(&chat_id).cloned()
+    }?;
+    let session = {
+        let sessions = state.sessions.lock().await;
+        sessions.get(&session_id).cloned()
+    }?;
+    if session.chat_id != chat_id {
+        return None;
+    }
+    let peeked_snapshot = state.peeked.lock().await.clone();
+    match &session.view {
+        ListView::Selected { index, .. } => session
+            .entries
+            .get(*index)
+            .map(|entry| entry.display_lines().join("\n")),
+        ListView::Peek { mode, page } => {
+            let indices = peek_indices_for_session(&session, &peeked_snapshot, *mode, *page);
+            if indices.len() == 1 {
+                session
+                    .entries
+                    .get(indices[0])
+                    .map(|entry| entry.display_lines().join("\n"))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 async fn handle_push_command(
@@ -1256,6 +1549,331 @@ async fn handle_resource_filename_response(
     Ok(())
 }
 
+async fn start_download_picker(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &std::sync::Arc<AppState>,
+    links: Vec<String>,
+) -> Result<()> {
+    let picker_id = short_id();
+    let text = build_download_picker_text(&links);
+    let kb = build_download_picker_keyboard(&picker_id, &links);
+    let sent = bot.send_message(chat_id, text).reply_markup(kb).await?;
+    let picker = DownloadPickerState {
+        chat_id: chat_id.0,
+        message_id: sent.id,
+        links,
+    };
+    state
+        .download_pickers
+        .lock()
+        .await
+        .insert(picker_id, picker);
+    Ok(())
+}
+
+async fn handle_download_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    state: std::sync::Arc<AppState>,
+) -> Result<()> {
+    let Some(message) = q.message.clone() else {
+        return Ok(());
+    };
+    let Some(data) = q.data.as_deref() else {
+        return Ok(());
+    };
+    let mut parts = data.split(':');
+    let _ = parts.next();
+    let picker_id = match parts.next() {
+        Some(id) => id.to_string(),
+        None => return Ok(()),
+    };
+    let action = match parts.next() {
+        Some(action) => action,
+        None => return Ok(()),
+    };
+
+    let picker = {
+        let mut pickers = state.download_pickers.lock().await;
+        let picker = match pickers.remove(&picker_id) {
+            Some(picker) => picker,
+            None => {
+                bot.answer_callback_query(q.id).await?;
+                return Ok(());
+            }
+        };
+        if picker.chat_id != message.chat.id.0 || picker.message_id != message.id {
+            pickers.insert(picker_id.clone(), picker);
+            bot.answer_callback_query(q.id).await?;
+            return Ok(());
+        }
+        picker
+    };
+
+    let mut reinsert = false;
+    bot.answer_callback_query(q.id).await?;
+
+    match action {
+        "send" => {
+            let index = parts.next().and_then(|p| p.parse::<usize>().ok());
+            if let Some(index) = index {
+                if let Some(link) = picker.links.get(index).cloned() {
+                    match download_and_send_link(&bot, message.chat.id, &link).await {
+                        Ok(()) => {
+                            let _ = bot.delete_message(message.chat.id, message.id).await;
+                        }
+                        Err(err) => {
+                            send_error(&bot, message.chat.id, &err.to_string()).await?;
+                            reinsert = true;
+                        }
+                    }
+                } else {
+                    reinsert = true;
+                }
+            } else {
+                reinsert = true;
+            }
+        }
+        "save" => {
+            let index = parts.next().and_then(|p| p.parse::<usize>().ok());
+            if let Some(index) = index {
+                if let Some(link) = picker.links.get(index).cloned() {
+                    match download_and_save_link(&state, &link).await {
+                        Ok(path) => {
+                            let note = format!("Saved to {}", path.display());
+                            let kb = InlineKeyboardMarkup::new(vec![vec![
+                                InlineKeyboardButton::callback("Delete message", "msgdel"),
+                            ]]);
+                            bot.send_message(message.chat.id, note)
+                                .reply_markup(kb)
+                                .await?;
+                            let _ = bot.delete_message(message.chat.id, message.id).await;
+                        }
+                        Err(err) => {
+                            send_error(&bot, message.chat.id, &err.to_string()).await?;
+                            reinsert = true;
+                        }
+                    }
+                } else {
+                    reinsert = true;
+                }
+            } else {
+                reinsert = true;
+            }
+        }
+        "add" => {
+            let prompt_text = "Send a link to add.";
+            let sent = bot.send_message(message.chat.id, prompt_text).await?;
+            let prompt = DownloadLinkPrompt {
+                links: picker.links.clone(),
+                prompt_message_id: sent.id,
+                expires_at: now_ts() + DOWNLOAD_PROMPT_TTL_SECS,
+            };
+            let previous = state
+                .download_link_prompts
+                .lock()
+                .await
+                .insert(message.chat.id.0, prompt);
+            if let Some(previous) = previous {
+                let _ = bot
+                    .delete_message(message.chat.id, previous.prompt_message_id)
+                    .await;
+            }
+            let _ = bot.delete_message(message.chat.id, message.id).await;
+        }
+        "cancel" => {
+            let _ = bot.delete_message(message.chat.id, message.id).await;
+        }
+        _ => {
+            reinsert = true;
+        }
+    }
+
+    if reinsert {
+        state
+            .download_pickers
+            .lock()
+            .await
+            .insert(picker_id, picker);
+    }
+
+    Ok(())
+}
+
+async fn handle_download_link_response(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: MessageId,
+    state: &std::sync::Arc<AppState>,
+    text: &str,
+    prompt: DownloadLinkPrompt,
+) -> Result<()> {
+    let new_links = extract_links(text);
+    if new_links.is_empty() {
+        send_error(bot, chat_id, "No links found. Send a URL.").await?;
+        let mut prompts = state.download_link_prompts.lock().await;
+        prompts.insert(
+            chat_id.0,
+            DownloadLinkPrompt {
+                expires_at: now_ts() + DOWNLOAD_PROMPT_TTL_SECS,
+                ..prompt
+            },
+        );
+        let _ = bot.delete_message(chat_id, message_id).await;
+        return Ok(());
+    }
+
+    let mut links = prompt.links.clone();
+    for link in new_links {
+        if !links.contains(&link) {
+            links.push(link);
+        }
+    }
+    start_download_picker(bot, chat_id, state, links).await?;
+    let _ = bot
+        .delete_message(chat_id, prompt.prompt_message_id)
+        .await;
+    let _ = bot.delete_message(chat_id, message_id).await;
+    Ok(())
+}
+
+async fn handle_message_delete_callback(bot: Bot, q: CallbackQuery) -> Result<()> {
+    if let Some(message) = q.message.clone() {
+        let _ = bot.delete_message(message.chat.id, message.id).await;
+    }
+    bot.answer_callback_query(q.id).await?;
+    Ok(())
+}
+
+async fn handle_finish_title_response(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: MessageId,
+    state: &std::sync::Arc<AppState>,
+    text: &str,
+    prompt: FinishTitlePrompt,
+) -> Result<()> {
+    let title = text.lines().next().unwrap_or("").trim();
+    if title.is_empty() {
+        send_error(bot, chat_id, "Provide a title.").await?;
+        let mut prompts = state.finish_title_prompts.lock().await;
+        prompts.insert(
+            chat_id.0,
+            FinishTitlePrompt {
+                expires_at: now_ts() + FINISH_TITLE_PROMPT_TTL_SECS,
+                ..prompt
+            },
+        );
+        let _ = bot.delete_message(chat_id, message_id).await;
+        return Ok(());
+    }
+
+    let updated_entry = entry_with_title(&prompt.entry, title, &prompt.link);
+    let mut session = {
+        let mut sessions = state.sessions.lock().await;
+        let session = match sessions.remove(&prompt.session_id) {
+            Some(session) => session,
+            None => {
+                let _ = bot
+                    .delete_message(chat_id, prompt.prompt_message_id)
+                    .await;
+                let _ = bot.delete_message(chat_id, message_id).await;
+                return Ok(());
+            }
+        };
+        if session.chat_id != prompt.chat_id {
+            sessions.insert(prompt.session_id.clone(), session);
+            let _ = bot
+                .delete_message(chat_id, prompt.prompt_message_id)
+                .await;
+            let _ = bot.delete_message(chat_id, message_id).await;
+            return Ok(());
+        }
+        session
+    };
+
+    let entry_index = session
+        .entries
+        .iter()
+        .position(|entry| entry.block_string() == prompt.entry);
+    let Some(entry_index) = entry_index else {
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(prompt.session_id.clone(), session);
+        send_error(bot, chat_id, "Item not found.").await?;
+        let _ = bot
+            .delete_message(chat_id, prompt.prompt_message_id)
+            .await;
+        let _ = bot.delete_message(chat_id, message_id).await;
+        return Ok(());
+    };
+
+    let op = QueuedOp {
+        kind: QueuedOpKind::MoveToFinishedUpdated,
+        entry: prompt.entry.clone(),
+        resource_path: None,
+        updated_entry: Some(updated_entry.clone()),
+    };
+
+    match apply_user_op(state, &op).await? {
+        UserOpOutcome::Applied(ApplyOutcome::Applied) => {
+            session.entries.remove(entry_index);
+            session.view = prompt.return_to.clone();
+            let peeked_snapshot = state.peeked.lock().await.clone();
+            normalize_peek_view(&mut session, &peeked_snapshot);
+            send_ephemeral(bot, chat_id, "Moved.", ACK_TTL_SECS).await?;
+            let _ = add_undo(state, UndoKind::MoveToFinished, updated_entry).await?;
+        }
+        UserOpOutcome::Applied(ApplyOutcome::NotFound) => {
+            send_error(bot, chat_id, "Item not found.").await?;
+        }
+        UserOpOutcome::Applied(ApplyOutcome::Duplicate) => {}
+        UserOpOutcome::Queued => {
+            send_error(bot, chat_id, "Write failed; queued for retry.").await?;
+        }
+    }
+
+    let peeked_snapshot = state.peeked.lock().await.clone();
+    let displayed_indices = displayed_indices_for_view(&session, &peeked_snapshot);
+    let (text, kb) = render_list_view(&session.id, &session, &peeked_snapshot);
+    if let Some(list_message_id) = session.message_id {
+        bot.edit_message_text(chat_id, list_message_id, text)
+            .reply_markup(kb)
+            .await?;
+    } else {
+        let sent = bot.send_message(chat_id, text).reply_markup(kb).await?;
+        session.message_id = Some(sent.id);
+    }
+    if !displayed_indices.is_empty() {
+        let mut peeked = state.peeked.lock().await;
+        for idx in displayed_indices {
+            if let Some(entry) = session.entries.get(idx) {
+                peeked.insert(entry.block_string());
+            }
+        }
+    }
+
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(prompt.session_id.clone(), session);
+    state
+        .active_sessions
+        .lock()
+        .await
+        .insert(chat_id.0, prompt.session_id.clone());
+
+    let _ = bot
+        .delete_message(chat_id, prompt.prompt_message_id)
+        .await;
+    let _ = bot.delete_message(chat_id, message_id).await;
+    Ok(())
+}
+
 async fn handle_list_callback(
     bot: Bot,
     q: CallbackQuery,
@@ -1281,15 +1899,15 @@ async fn handle_list_callback(
     let chat_id = message.chat.id.0;
     let mut session = {
         let mut sessions = state.sessions.lock().await;
-        let session = match sessions.remove(&chat_id) {
+        let session = match sessions.remove(&session_id) {
             Some(session) => session,
             None => {
                 bot.answer_callback_query(q.id).await?;
                 return Ok(());
             }
         };
-        if session.id != session_id {
-            sessions.insert(chat_id, session);
+        if session.chat_id != chat_id {
+            sessions.insert(session_id.clone(), session);
             bot.answer_callback_query(q.id).await?;
             return Ok(());
         }
@@ -1344,6 +1962,10 @@ async fn handle_list_callback(
         "close" => {
             if matches!(&session.kind, SessionKind::Search { .. }) {
                 bot.delete_message(message.chat.id, message.id).await?;
+                let mut active = state.active_sessions.lock().await;
+                if active.get(&chat_id) == Some(&session.id) {
+                    active.remove(&chat_id);
+                }
                 bot.answer_callback_query(q.id).await?;
                 return Ok(());
             }
@@ -1390,7 +2012,7 @@ async fn handle_list_callback(
                 let pick_index = parts.next().and_then(|p| p.parse::<usize>().ok());
                 if let Some(pick_index) = pick_index {
                     if let Some(entry_index) =
-                        peek_indices(&session.entries, &peeked_snapshot, mode, page)
+                        peek_indices_for_session(&session, &peeked_snapshot, mode, page)
                             .get(pick_index.saturating_sub(1))
                             .copied()
                     {
@@ -1404,7 +2026,15 @@ async fn handle_list_callback(
             }
         }
         "finish" => {
-            if let ListView::Selected { index, return_to } = session.view.clone() {
+            if let ListView::Selected { index, .. } = session.view.clone() {
+                session.view = ListView::FinishConfirm {
+                    selected: Box::new(session.view.clone()),
+                    index,
+                };
+            }
+        }
+        "finish_now" => {
+            if let ListView::FinishConfirm { selected, index } = session.view.clone() {
                 let entry_block = session.entries.get(index).map(|e| e.block_string());
                 if let Some(entry_block) = entry_block {
                     let op = QueuedOp {
@@ -1416,7 +2046,11 @@ async fn handle_list_callback(
                     match apply_user_op(&state, &op).await? {
                         UserOpOutcome::Applied(ApplyOutcome::Applied) => {
                             session.entries.remove(index);
-                            session.view = *return_to;
+                            if let ListView::Selected { return_to, .. } = *selected {
+                                session.view = *return_to;
+                            } else {
+                                session.view = ListView::Menu;
+                            }
                             normalize_peek_view(&mut session, &peeked_snapshot);
                             send_ephemeral(&bot, message.chat.id, "Moved.", ACK_TTL_SECS)
                                 .await?;
@@ -1424,14 +2058,66 @@ async fn handle_list_callback(
                         }
                         UserOpOutcome::Applied(ApplyOutcome::NotFound) => {
                             send_error(&bot, message.chat.id, "Item not found.").await?;
+                            session.view = *selected;
                         }
-                        UserOpOutcome::Applied(ApplyOutcome::Duplicate) => {}
+                        UserOpOutcome::Applied(ApplyOutcome::Duplicate) => {
+                            session.view = *selected;
+                        }
                         UserOpOutcome::Queued => {
                             send_error(&bot, message.chat.id, "Write failed; queued for retry.")
                                 .await?;
+                            session.view = *selected;
                         }
                     }
                 }
+            }
+        }
+        "finish_title" => {
+            if let ListView::FinishConfirm { selected, index } = session.view.clone() {
+                let selected_view = *selected;
+                if let Some(entry) = session.entries.get(index) {
+                    let text = entry.display_lines().join("\n");
+                    let links = extract_links(&text);
+                    if let Some(link) = links.first().cloned() {
+                        let prompt_text = "Send a title for the finished item.";
+                        let sent = bot.send_message(message.chat.id, prompt_text).await?;
+                        let return_to = match selected_view.clone() {
+                            ListView::Selected { return_to, .. } => *return_to,
+                            _ => ListView::Menu,
+                        };
+                        let prompt = FinishTitlePrompt {
+                            session_id: session.id.clone(),
+                            chat_id,
+                            entry: entry.block_string(),
+                            link,
+                            return_to,
+                            prompt_message_id: sent.id,
+                            expires_at: now_ts() + FINISH_TITLE_PROMPT_TTL_SECS,
+                        };
+                        let previous = state
+                            .finish_title_prompts
+                            .lock()
+                            .await
+                            .insert(chat_id, prompt);
+                        if let Some(previous) = previous {
+                            let _ = bot
+                                .delete_message(message.chat.id, previous.prompt_message_id)
+                                .await;
+                        }
+                        session.view = selected_view;
+                    } else {
+                        send_error(&bot, message.chat.id, "No link found for a title.").await?;
+                        session.view = selected_view;
+                    }
+                } else {
+                    send_error(&bot, message.chat.id, "Item not found.").await?;
+                    session.view = selected_view;
+                }
+            }
+        }
+        "finish_cancel" => {
+            if let ListView::FinishConfirm { selected, .. } = session.view.clone() {
+                session.view = *selected;
             }
         }
         "resource" => {
@@ -1540,7 +2226,16 @@ async fn handle_list_callback(
     let displayed_indices = displayed_indices_for_view(&session, &peeked_snapshot);
     let (text, kb) = render_list_view(&session.id, &session, &peeked_snapshot);
     let session_clone = session.clone();
-    state.sessions.lock().await.insert(chat_id, session);
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.id.clone(), session);
+    state
+        .active_sessions
+        .lock()
+        .await
+        .insert(chat_id, session_clone.id.clone());
     bot.edit_message_text(message.chat.id, message.id, text)
         .reply_markup(kb)
         .await?;
@@ -1551,6 +2246,9 @@ async fn handle_list_callback(
                 peeked.insert(entry.block_string());
             }
         }
+    }
+    if let Err(err) = send_embedded_media_for_selected(&bot, message.chat.id, &state, &session_clone).await {
+        error!("send embedded media failed: {:#}", err);
     }
     bot.answer_callback_query(q.id).await?;
     Ok(())
@@ -1917,6 +2615,25 @@ async fn apply_op(state: &std::sync::Arc<AppState>, op: &QueuedOp) -> Result<App
                     &state.config.read_later_path,
                     &state.config.finished_path,
                     &op.entry,
+                )
+            })
+            .await?;
+            Ok(match outcome {
+                ModifyOutcome::Applied => ApplyOutcome::Applied,
+                ModifyOutcome::NotFound => ApplyOutcome::NotFound,
+            })
+        }
+        QueuedOpKind::MoveToFinishedUpdated => {
+            let updated_entry = op
+                .updated_entry
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing updated entry"))?;
+            let outcome = with_retries(|| {
+                move_to_finished_updated_sync(
+                    &state.config.read_later_path,
+                    &state.config.finished_path,
+                    &op.entry,
+                    updated_entry,
                 )
             })
             .await?;
@@ -2459,6 +3176,79 @@ fn split_items(text: &str) -> Vec<String> {
         .collect()
 }
 
+async fn download_and_send_link(bot: &Bot, chat_id: ChatId, link: &str) -> Result<()> {
+    let temp_dir = TempDir::new().context("create download temp dir")?;
+    let target_dir = temp_dir.path().to_path_buf();
+    let link = link.to_string();
+    let path = tokio::task::spawn_blocking(move || run_ytdlp_download(&target_dir, &link))
+        .await
+        .context("yt-dlp task failed")??;
+    bot.send_document(chat_id, InputFile::file(path)).await?;
+    Ok(())
+}
+
+async fn download_and_save_link(
+    state: &std::sync::Arc<AppState>,
+    link: &str,
+) -> Result<PathBuf> {
+    let target_dir = state.config.media_dir.clone();
+    fs::create_dir_all(&target_dir)
+        .with_context(|| format!("create media dir {}", target_dir.display()))?;
+    let link = link.to_string();
+    let path = tokio::task::spawn_blocking(move || run_ytdlp_download(&target_dir, &link))
+        .await
+        .context("yt-dlp task failed")??;
+    if !path.exists() {
+        return Err(anyhow!("Download completed but file is missing."));
+    }
+    Ok(path)
+}
+
+fn run_ytdlp_download(target_dir: &Path, link: &str) -> Result<PathBuf> {
+    let template = target_dir.join("%(title).200B-%(id)s.%(ext)s");
+    let output = Command::new("yt-dlp")
+        .arg("--no-playlist")
+        .arg("--print")
+        .arg("after_move:filepath")
+        .arg("-o")
+        .arg(template.to_string_lossy().to_string())
+        .arg(link)
+        .output()
+        .context("run yt-dlp")?;
+    if !output.status.success() {
+        return Err(anyhow!(format_ytdlp_error(&output)));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let path_line = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| anyhow!("yt-dlp did not return a filepath"))?;
+    let mut path = PathBuf::from(path_line.trim());
+    if path.is_relative() {
+        path = target_dir.join(path);
+    }
+    if !path.exists() {
+        return Err(anyhow!("yt-dlp output not found: {}", path.display()));
+    }
+    Ok(path)
+}
+
+fn format_ytdlp_error(output: &std::process::Output) -> String {
+    let mut message = "yt-dlp failed.".to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stdout.is_empty() {
+        message.push_str("\nstdout:\n");
+        message.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        message.push_str("\nstderr:\n");
+        message.push_str(&stderr);
+    }
+    message
+}
+
 fn search_entries(entries: &[EntryBlock], query: &str) -> Vec<EntryBlock> {
     entries
         .iter()
@@ -2483,8 +3273,9 @@ fn displayed_indices_for_view(
     peeked: &HashSet<String>,
 ) -> Vec<usize> {
     match session.view {
-        ListView::Peek { mode, page } => peek_indices(&session.entries, peeked, mode, page),
+        ListView::Peek { mode, page } => peek_indices_for_session(session, peeked, mode, page),
         ListView::Selected { index, .. } => vec![index],
+        ListView::FinishConfirm { index, .. } => vec![index],
         _ => Vec::new(),
     }
 }
@@ -2492,8 +3283,9 @@ fn displayed_indices_for_view(
 fn norm_target_index(session: &ListSession, peeked: &HashSet<String>) -> Option<usize> {
     match &session.view {
         ListView::Selected { index, .. } => Some(*index),
+        ListView::FinishConfirm { index, .. } => Some(*index),
         ListView::Peek { mode, page } => {
-            let indices = peek_indices(&session.entries, peeked, *mode, *page);
+            let indices = peek_indices_for_session(session, peeked, *mode, *page);
             if indices.len() == 1 {
                 indices.first().copied()
             } else {
@@ -2560,6 +3352,93 @@ fn normalize_markdown_links(text: &str) -> (String, bool) {
 
     out.push_str(&text[index..]);
     (out, changed)
+}
+
+fn extract_links(text: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    let mut index = 0;
+    while let Some(start_rel) = text[index..].find('[') {
+        let start = index + start_rel;
+        let label_start = start + 1;
+        let Some(label_end_rel) = text[label_start..].find(']') else {
+            break;
+        };
+        let label_end = label_start + label_end_rel;
+        let after_label = label_end + 1;
+        if after_label >= text.len() || !text[after_label..].starts_with('(') {
+            index = after_label;
+            continue;
+        }
+        let url_start = after_label + 1;
+        let Some(url_end_rel) = text[url_start..].find(')') else {
+            break;
+        };
+        let url_end = url_start + url_end_rel;
+        let url = text[url_start..url_end].trim();
+        if is_http_link(url) {
+            push_link(&mut links, &mut seen, url.to_string());
+        }
+        index = url_end + 1;
+    }
+
+    let mut scan = 0;
+    while scan < text.len() {
+        let slice = &text[scan..];
+        let http_pos = slice.find("http://");
+        let https_pos = slice.find("https://");
+        let pos = match (http_pos, https_pos) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let Some(pos) = pos else {
+            break;
+        };
+        let start = scan + pos;
+        let rest = &text[start..];
+        let end_rel = rest
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(rest.len());
+        let end = start + end_rel;
+        let mut url = text[start..end].to_string();
+        url = trim_link(&url);
+        if is_http_link(&url) {
+            push_link(&mut links, &mut seen, url);
+        }
+        scan = end;
+    }
+
+    links
+}
+
+fn is_http_link(link: &str) -> bool {
+    link.starts_with("http://") || link.starts_with("https://")
+}
+
+fn push_link(links: &mut Vec<String>, seen: &mut HashSet<String>, link: String) {
+    if seen.insert(link.clone()) {
+        links.push(link);
+    }
+}
+
+fn trim_link(link: &str) -> String {
+    link.trim()
+        .trim_end_matches(|c: char| ")]}>\"'.,;:!?".contains(c))
+        .to_string()
+}
+
+fn entry_with_title(entry: &str, title: &str, link: &str) -> String {
+    let mut entry = EntryBlock::from_block(entry);
+    let line = format!("- [{}]({})", title.trim(), link);
+    if entry.lines.is_empty() {
+        entry.lines.push(line);
+    } else {
+        entry.lines[0] = line;
+    }
+    entry.block_string()
 }
 
 fn build_picker_text(items: &[String], selected: &[bool]) -> String {
@@ -2654,6 +3533,45 @@ fn build_resource_picker_keyboard(
     InlineKeyboardMarkup::new(rows)
 }
 
+fn build_download_picker_text(links: &[String]) -> String {
+    if links.is_empty() {
+        return "No links found. Add one?".to_string();
+    }
+    let mut text = String::from("Links:\n\n");
+    for (idx, link) in links.iter().enumerate() {
+        text.push_str(&format!("{}: {}\n", idx + 1, link));
+    }
+    text.trim_end().to_string()
+}
+
+fn build_download_picker_keyboard(
+    picker_id: &str,
+    links: &[String],
+) -> InlineKeyboardMarkup {
+    let mut rows = Vec::new();
+    for (idx, _) in links.iter().enumerate() {
+        rows.push(vec![
+            InlineKeyboardButton::callback(
+                format!("Send {}", idx + 1),
+                format!("dl:{}:send:{}", picker_id, idx),
+            ),
+            InlineKeyboardButton::callback(
+                format!("Save {}", idx + 1),
+                format!("dl:{}:save:{}", picker_id, idx),
+            ),
+        ]);
+    }
+    rows.push(vec![InlineKeyboardButton::callback(
+        "Add link",
+        format!("dl:{}:add", picker_id),
+    )]);
+    rows.push(vec![InlineKeyboardButton::callback(
+        "Cancel",
+        format!("dl:{}:cancel", picker_id),
+    )]);
+    InlineKeyboardMarkup::new(rows)
+}
+
 fn render_list_view(
     session_id: &str,
     session: &ListSession,
@@ -2663,6 +3581,9 @@ fn render_list_view(
         ListView::Menu => build_menu_view(session_id, session),
         ListView::Peek { mode, page } => build_peek_view(session_id, session, *mode, *page, peeked),
         ListView::Selected { index, .. } => build_selected_view(session_id, session, *index),
+        ListView::FinishConfirm { index, .. } => {
+            build_finish_confirm_view(session_id, session, *index)
+        }
         ListView::DeleteConfirm { step, index, .. } => {
             build_delete_confirm_view(session_id, session, *index, *step)
         }
@@ -2730,8 +3651,8 @@ fn build_peek_view(
     page: usize,
     peeked: &HashSet<String>,
 ) -> (String, InlineKeyboardMarkup) {
-    let total_unpeeked = count_unpeeked_entries(&session.entries, peeked);
-    let indices = peek_indices(&session.entries, peeked, mode, page);
+    let total_unpeeked = count_visible_entries(session, peeked);
+    let indices = peek_indices_for_session(session, peeked, mode, page);
     let total_pages = if total_unpeeked == 0 {
         0
     } else {
@@ -2909,6 +3830,41 @@ fn build_undos_view(session_id: &str, records: &[UndoRecord]) -> (String, Inline
     (text.trim_end().to_string(), InlineKeyboardMarkup::new(rows))
 }
 
+fn build_finish_confirm_view(
+    session_id: &str,
+    session: &ListSession,
+    index: usize,
+) -> (String, InlineKeyboardMarkup) {
+    let entry = session.entries.get(index);
+    let preview = entry.map(|e| e.preview_lines()).unwrap_or_default();
+    let mut text = String::from("Finish this item?\n\n");
+    if let Some(first) = preview.get(0) {
+        text.push_str(first);
+        text.push('\n');
+    }
+    if let Some(second) = preview.get(1) {
+        text.push_str(second);
+        text.push('\n');
+    }
+
+    let rows = vec![
+        vec![InlineKeyboardButton::callback(
+            "Finish",
+            format!("ls:{}:finish_now", session_id),
+        )],
+        vec![InlineKeyboardButton::callback(
+            "Finish + Title",
+            format!("ls:{}:finish_title", session_id),
+        )],
+        vec![InlineKeyboardButton::callback(
+            "Cancel",
+            format!("ls:{}:finish_cancel", session_id),
+        )],
+    ];
+
+    (text.trim_end().to_string(), InlineKeyboardMarkup::new(rows))
+}
+
 fn build_delete_confirm_view(
     session_id: &str,
     session: &ListSession,
@@ -2949,6 +3905,13 @@ fn count_unpeeked_entries(entries: &[EntryBlock], peeked: &HashSet<String>) -> u
         .count()
 }
 
+fn count_visible_entries(session: &ListSession, peeked: &HashSet<String>) -> usize {
+    match session.kind {
+        SessionKind::Search { .. } => session.entries.len(),
+        SessionKind::List => count_unpeeked_entries(&session.entries, peeked),
+    }
+}
+
 fn ordered_unpeeked_indices(
     entries: &[EntryBlock],
     peeked: &HashSet<String>,
@@ -2960,6 +3923,14 @@ fn ordered_unpeeked_indices(
         .filter(|(_, entry)| !peeked.contains(&entry.block_string()))
         .map(|(idx, _)| idx)
         .collect();
+    if matches!(mode, ListMode::Bottom) {
+        indices.reverse();
+    }
+    indices
+}
+
+fn ordered_indices(entries: &[EntryBlock], mode: ListMode) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..entries.len()).collect();
     if matches!(mode, ListMode::Bottom) {
         indices.reverse();
     }
@@ -2984,9 +3955,34 @@ fn peek_indices(
     ordered[start..end].to_vec()
 }
 
+fn peek_indices_all(entries: &[EntryBlock], mode: ListMode, page: usize) -> Vec<usize> {
+    let ordered = ordered_indices(entries, mode);
+    if ordered.is_empty() {
+        return Vec::new();
+    }
+    let start = page * PAGE_SIZE;
+    if start >= ordered.len() {
+        return Vec::new();
+    }
+    let end = (start + PAGE_SIZE).min(ordered.len());
+    ordered[start..end].to_vec()
+}
+
+fn peek_indices_for_session(
+    session: &ListSession,
+    peeked: &HashSet<String>,
+    mode: ListMode,
+    page: usize,
+) -> Vec<usize> {
+    match session.kind {
+        SessionKind::Search { .. } => peek_indices_all(&session.entries, mode, page),
+        SessionKind::List => peek_indices(&session.entries, peeked, mode, page),
+    }
+}
+
 fn normalize_peek_view(session: &mut ListSession, peeked: &HashSet<String>) {
     if let ListView::Peek { mode, page } = session.view.clone() {
-        let indices = peek_indices(&session.entries, peeked, mode, page);
+        let indices = peek_indices_for_session(session, peeked, mode, page);
         if indices.is_empty() && page > 0 {
             session.view = ListView::Peek {
                 mode,
@@ -3036,6 +4032,30 @@ async fn send_ephemeral(
 
 async fn send_error(bot: &Bot, chat_id: ChatId, text: &str) -> Result<()> {
     bot.send_message(chat_id, text).await?;
+    Ok(())
+}
+
+async fn send_embedded_media_for_selected(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &std::sync::Arc<AppState>,
+    session: &ListSession,
+) -> Result<()> {
+    let ListView::Selected { index, .. } = session.view else {
+        return Ok(());
+    };
+    let Some(entry) = session.entries.get(index) else {
+        return Ok(());
+    };
+    let lines = entry.display_lines();
+    let embeds = extract_embedded_paths(&lines, &state.config);
+    for path in embeds {
+        if is_image_path(&path) {
+            bot.send_photo(chat_id, InputFile::file(path)).await?;
+        } else {
+            bot.send_document(chat_id, InputFile::file(path)).await?;
+        }
+    }
     Ok(())
 }
 
@@ -3130,12 +4150,19 @@ fn load_config(path: &Path) -> Result<Config> {
     let config_file: ConfigFile = toml::from_str(&contents).context("parse config")?;
     let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let user_id = resolve_user_id(config_file.user_id, config_dir)?;
+    let default_media_dir = config_file
+        .read_later_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("Misc/images_misc");
+    let media_dir = config_file.media_dir.unwrap_or(default_media_dir);
     Ok(Config {
         token: config_file.token,
         user_id,
         read_later_path: config_file.read_later_path,
         finished_path: config_file.finished_path,
         resources_path: config_file.resources_path,
+        media_dir,
         data_dir: config_file.data_dir,
         retry_interval_seconds: config_file.retry_interval_seconds,
         sync: config_file.sync,
@@ -3330,6 +4357,29 @@ fn move_to_finished_sync(
     Ok(ModifyOutcome::Applied)
 }
 
+fn move_to_finished_updated_sync(
+    read_later: &Path,
+    finished: &Path,
+    entry_block: &str,
+    updated_entry: &str,
+) -> Result<ModifyOutcome> {
+    let (preamble_rl, mut entries_rl) = read_entries(read_later)?;
+    let pos = entries_rl
+        .iter()
+        .position(|e| e.block_string() == entry_block);
+    let Some(pos) = pos else {
+        return Ok(ModifyOutcome::NotFound);
+    };
+    entries_rl.remove(pos);
+
+    let (preamble_fin, mut entries_fin) = read_entries(finished)?;
+    let updated_entry = EntryBlock::from_block(updated_entry);
+    entries_fin.insert(0, updated_entry);
+    write_entries(finished, &preamble_fin, &entries_fin)?;
+    write_entries(read_later, &preamble_rl, &entries_rl)?;
+    Ok(ModifyOutcome::Applied)
+}
+
 fn move_to_read_later_sync(
     read_later: &Path,
     finished: &Path,
@@ -3417,6 +4467,112 @@ fn sanitize_resource_filename(input: &str) -> Result<String> {
         name.push_str(".md");
     }
     Ok(name)
+}
+
+fn sanitize_filename_with_default(input: &str, default_ext: Option<&str>) -> String {
+    let mut sanitized: String = input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        sanitized = "file".to_string();
+    }
+    if Path::new(&sanitized).extension().is_none() {
+        if let Some(ext) = default_ext {
+            sanitized.push('.');
+            sanitized.push_str(ext);
+        }
+    }
+    sanitized
+}
+
+fn extension_from_mime(mime: &str) -> Option<&str> {
+    let (_, subtype) = mime.split_once('/')?;
+    if subtype.eq_ignore_ascii_case("jpeg") {
+        Some("jpg")
+    } else {
+        Some(subtype)
+    }
+}
+
+fn build_media_entry_text(filename: &str, caption: Option<&str>) -> String {
+    let mut text = format!("![[{}]]", filename);
+    if let Some(caption) = caption {
+        let normalized = normalize_line_endings(caption).trim().to_string();
+        if !normalized.is_empty() {
+            text.push('\n');
+            text.push_str(&normalized);
+        }
+    }
+    text
+}
+
+fn pick_best_photo(photos: &[teloxide::types::PhotoSize]) -> Option<&teloxide::types::PhotoSize> {
+    photos.iter().max_by_key(|photo| {
+        photo.file.size.max((photo.width * photo.height) as u32) as u64
+    })
+}
+
+async fn download_telegram_file(bot: &Bot, file_id: &str, dest_path: &Path) -> Result<()> {
+    let file = bot.get_file(file_id).await?;
+    let mut out = tokio::fs::File::create(dest_path).await?;
+    bot.download_file(&file.path, &mut out).await?;
+    Ok(())
+}
+
+fn extract_embedded_paths(lines: &[String], config: &Config) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    let vault_root = config
+        .read_later_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    for line in lines {
+        let mut index = 0;
+        while let Some(start_rel) = line[index..].find("![[") {
+            let start = index + start_rel + 3;
+            let Some(end_rel) = line[start..].find("]]") else {
+                break;
+            };
+            let end = start + end_rel;
+            let mut inner = line[start..end].trim();
+            if let Some((path_part, _)) = inner.split_once('|') {
+                inner = path_part.trim();
+            }
+            if inner.is_empty() {
+                index = end + 2;
+                continue;
+            }
+            let path = if Path::new(inner).is_absolute() {
+                PathBuf::from(inner)
+            } else if inner.contains('/') || inner.contains('\\') {
+                vault_root.join(inner)
+            } else {
+                config.media_dir.join(inner)
+            };
+            if path.exists() && seen.insert(path.clone()) {
+                paths.push(path);
+            }
+            index = end + 2;
+        }
+    }
+    paths
+}
+
+fn is_image_path(path: &Path) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) => matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+        ),
+        None => false,
+    }
 }
 
 fn parse_command(text: &str) -> Option<&str> {
@@ -3561,6 +4717,7 @@ mod tests {
         let entries = vec![entry("one"), entry("two")];
         let session = ListSession {
             id: "session".to_string(),
+            chat_id: 0,
             kind: SessionKind::List,
             entries: entries.clone(),
             view: ListView::Peek {
@@ -3605,6 +4762,7 @@ mod tests {
         let entries = vec![entry("one"), entry("two"), entry("three")];
         let session = ListSession {
             id: "session".to_string(),
+            chat_id: 0,
             kind: SessionKind::List,
             entries,
             view: ListView::Selected {
@@ -3625,6 +4783,7 @@ mod tests {
         peeked.insert(entries[0].block_string());
         let session = ListSession {
             id: "session".to_string(),
+            chat_id: 0,
             kind: SessionKind::List,
             entries: entries.clone(),
             view: ListView::Peek {
