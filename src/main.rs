@@ -940,14 +940,12 @@ async fn handle_search_command(
     };
 
     let peeked_snapshot = state.peeked.lock().await.clone();
-    let displayed_indices = displayed_indices_for_view(&session, &peeked_snapshot);
     let (text, kb) = render_list_view(&session_id, &session, &peeked_snapshot);
     let sent = bot
         .send_message(msg.chat.id, text)
         .reply_markup(kb)
         .await?;
     session.message_id = Some(sent.id);
-    mark_displayed_entries_as_peeked(&state, &session, &displayed_indices).await;
     state
         .sessions
         .lock()
@@ -1830,7 +1828,6 @@ async fn handle_finish_title_response(
     }
 
     let peeked_snapshot = state.peeked.lock().await.clone();
-    let displayed_indices = displayed_indices_for_view(&session, &peeked_snapshot);
     let (text, kb) = render_list_view(&session.id, &session, &peeked_snapshot);
     if let Some(list_message_id) = session.message_id {
         bot.edit_message_text(chat_id, list_message_id, text)
@@ -1840,8 +1837,6 @@ async fn handle_finish_title_response(
         let sent = bot.send_message(chat_id, text).reply_markup(kb).await?;
         session.message_id = Some(sent.id);
     }
-    mark_displayed_entries_as_peeked(state, &session, &displayed_indices).await;
-
     state
         .sessions
         .lock()
@@ -1982,13 +1977,19 @@ async fn handle_list_callback(
                         // Stay in place.
                         session.view = ListView::Menu;
                     } else {
-                    let mut rng = rand::thread_rng();
-                    remaining.shuffle(&mut rng);
-                    if let Some(index) = remaining.first().copied() {
-                        session.seen_random.insert(index);
-                        let return_to = Box::new(session.view.clone());
-                        session.view = ListView::Selected { return_to, index };
-                    }
+                        let index = {
+                            let mut rng = rand::thread_rng();
+                            remaining.shuffle(&mut rng);
+                            remaining.first().copied()
+                        };
+                        if let Some(index) = index {
+                            session.seen_random.insert(index);
+                            let return_to = Box::new(session.view.clone());
+                            session.view = ListView::Selected { return_to, index };
+                            if let Some(entry) = session.entries.get(index) {
+                                state.peeked.lock().await.insert(entry.block_string());
+                            }
+                        }
                     }
                 }
             }
@@ -2007,6 +2008,11 @@ async fn handle_list_callback(
                             return_to,
                             index: entry_index,
                         };
+                        if matches!(&session.kind, SessionKind::List) {
+                            if let Some(entry) = session.entries.get(entry_index) {
+                                state.peeked.lock().await.insert(entry.block_string());
+                            }
+                        }
                     }
                 }
             }
@@ -2209,7 +2215,6 @@ async fn handle_list_callback(
     }
 
     session.message_id = Some(message.id);
-    let displayed_indices = displayed_indices_for_view(&session, &peeked_snapshot);
     let (text, kb) = render_list_view(&session.id, &session, &peeked_snapshot);
     let session_clone = session.clone();
     state
@@ -2225,7 +2230,6 @@ async fn handle_list_callback(
     bot.edit_message_text(message.chat.id, message.id, text)
         .reply_markup(kb)
         .await?;
-    mark_displayed_entries_as_peeked(&state, &session_clone, &displayed_indices).await;
     if let Err(err) = send_embedded_media_for_selected(&bot, message.chat.id, &state, &session_clone).await {
         error!("send embedded media failed: {:#}", err);
     }
@@ -3247,6 +3251,7 @@ fn matches_query(entry: &EntryBlock, query: &str) -> bool {
         .all(|term| haystack.contains(term))
 }
 
+#[cfg(test)]
 fn displayed_indices_for_view(
     session: &ListSession,
     peeked: &HashSet<String>,
@@ -3256,23 +3261,6 @@ fn displayed_indices_for_view(
         ListView::Selected { index, .. } => vec![index],
         ListView::FinishConfirm { index, .. } => vec![index],
         _ => Vec::new(),
-    }
-}
-
-async fn mark_displayed_entries_as_peeked(
-    state: &std::sync::Arc<AppState>,
-    session: &ListSession,
-    displayed_indices: &[usize],
-) {
-    if displayed_indices.is_empty() || !matches!(&session.kind, SessionKind::List) {
-        return;
-    }
-
-    let mut peeked = state.peeked.lock().await;
-    for idx in displayed_indices {
-        if let Some(entry) = session.entries.get(*idx) {
-            peeked.insert(entry.block_string());
-        }
     }
 }
 
