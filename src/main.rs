@@ -947,14 +947,7 @@ async fn handle_search_command(
         .reply_markup(kb)
         .await?;
     session.message_id = Some(sent.id);
-    if !displayed_indices.is_empty() {
-        let mut peeked = state.peeked.lock().await;
-        for idx in displayed_indices {
-            if let Some(entry) = session.entries.get(idx) {
-                peeked.insert(entry.block_string());
-            }
-        }
-    }
+    mark_displayed_entries_as_peeked(&state, &session, &displayed_indices).await;
     state
         .sessions
         .lock()
@@ -1847,14 +1840,7 @@ async fn handle_finish_title_response(
         let sent = bot.send_message(chat_id, text).reply_markup(kb).await?;
         session.message_id = Some(sent.id);
     }
-    if !displayed_indices.is_empty() {
-        let mut peeked = state.peeked.lock().await;
-        for idx in displayed_indices {
-            if let Some(entry) = session.entries.get(idx) {
-                peeked.insert(entry.block_string());
-            }
-        }
-    }
+    mark_displayed_entries_as_peeked(state, &session, &displayed_indices).await;
 
     state
         .sessions
@@ -2239,14 +2225,7 @@ async fn handle_list_callback(
     bot.edit_message_text(message.chat.id, message.id, text)
         .reply_markup(kb)
         .await?;
-    if !displayed_indices.is_empty() {
-        let mut peeked = state.peeked.lock().await;
-        for idx in displayed_indices {
-            if let Some(entry) = session_clone.entries.get(idx) {
-                peeked.insert(entry.block_string());
-            }
-        }
-    }
+    mark_displayed_entries_as_peeked(&state, &session_clone, &displayed_indices).await;
     if let Err(err) = send_embedded_media_for_selected(&bot, message.chat.id, &state, &session_clone).await {
         error!("send embedded media failed: {:#}", err);
     }
@@ -3277,6 +3256,23 @@ fn displayed_indices_for_view(
         ListView::Selected { index, .. } => vec![index],
         ListView::FinishConfirm { index, .. } => vec![index],
         _ => Vec::new(),
+    }
+}
+
+async fn mark_displayed_entries_as_peeked(
+    state: &std::sync::Arc<AppState>,
+    session: &ListSession,
+    displayed_indices: &[usize],
+) {
+    if displayed_indices.is_empty() || !matches!(&session.kind, SessionKind::List) {
+        return;
+    }
+
+    let mut peeked = state.peeked.lock().await;
+    for idx in displayed_indices {
+        if let Some(entry) = session.entries.get(*idx) {
+            peeked.insert(entry.block_string());
+        }
     }
 }
 
@@ -4709,6 +4705,41 @@ mod tests {
         assert_eq!(
             peek_indices(&entries, &peeked, ListMode::Bottom, 1),
             vec![0]
+        );
+    }
+
+    #[test]
+    fn search_peek_indices_ignore_peeked_entries() {
+        let entries: Vec<EntryBlock> = (0..4)
+            .map(|i| entry(&format!("match {}", i)))
+            .collect();
+        let session = ListSession {
+            id: "session".to_string(),
+            chat_id: 0,
+            kind: SessionKind::Search {
+                query: "match".to_string(),
+            },
+            entries: entries.clone(),
+            view: ListView::Peek {
+                mode: ListMode::Top,
+                page: 0,
+            },
+            seen_random: HashSet::new(),
+            message_id: None,
+        };
+        let mut peeked = HashSet::new();
+        for entry in &entries {
+            peeked.insert(entry.block_string());
+        }
+
+        assert_eq!(count_visible_entries(&session, &peeked), 4);
+        assert_eq!(
+            peek_indices_for_session(&session, &peeked, ListMode::Top, 0),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            peek_indices_for_session(&session, &peeked, ListMode::Top, 1),
+            vec![3]
         );
     }
 
