@@ -711,7 +711,8 @@ async fn handle_norm_message(
     match apply_user_op(state, &op).await? {
         UserOpOutcome::Applied(ApplyOutcome::Applied) => {
             session.entries[target_index] = normalized_entry;
-            let (text, kb) = render_list_view(&session.id, &session, &peeked_snapshot);
+            let (text, kb) =
+                render_list_view(&session.id, &session, &peeked_snapshot, &state.config);
             if let Some(message_id) = session.message_id {
                 bot.edit_message_text(chat_id, message_id, text)
                     .reply_markup(kb)
@@ -719,6 +720,11 @@ async fn handle_norm_message(
             } else {
                 let sent = bot.send_message(chat_id, text).reply_markup(kb).await?;
                 session.message_id = Some(sent.id);
+            }
+            if let Err(err) =
+                send_embedded_media_for_view(bot, chat_id, state, &session, &peeked_snapshot).await
+            {
+                error!("send embedded media failed: {:#}", err);
             }
         }
         UserOpOutcome::Applied(ApplyOutcome::NotFound)
@@ -805,7 +811,8 @@ async fn handle_instant_delete_message(
             }
             let _ = add_undo(state, UndoKind::Delete, op.entry.clone()).await?;
             normalize_peek_view(&mut session, &peeked_snapshot);
-            let (text, kb) = render_list_view(&session.id, &session, &peeked_snapshot);
+            let (text, kb) =
+                render_list_view(&session.id, &session, &peeked_snapshot, &state.config);
             if let Some(message_id) = session.message_id {
                 bot.edit_message_text(chat_id, message_id, text)
                     .reply_markup(kb)
@@ -813,6 +820,11 @@ async fn handle_instant_delete_message(
             } else {
                 let sent = bot.send_message(chat_id, text).reply_markup(kb).await?;
                 session.message_id = Some(sent.id);
+            }
+            if let Err(err) =
+                send_embedded_media_for_view(bot, chat_id, state, &session, &peeked_snapshot).await
+            {
+                error!("send embedded media failed: {:#}", err);
             }
         }
         UserOpOutcome::Applied(ApplyOutcome::NotFound)
@@ -940,7 +952,7 @@ async fn handle_search_command(
     };
 
     let peeked_snapshot = state.peeked.lock().await.clone();
-    let (text, kb) = render_list_view(&session_id, &session, &peeked_snapshot);
+    let (text, kb) = render_list_view(&session_id, &session, &peeked_snapshot, &state.config);
     let sent = bot
         .send_message(msg.chat.id, text)
         .reply_markup(kb)
@@ -1828,7 +1840,7 @@ async fn handle_finish_title_response(
     }
 
     let peeked_snapshot = state.peeked.lock().await.clone();
-    let (text, kb) = render_list_view(&session.id, &session, &peeked_snapshot);
+    let (text, kb) = render_list_view(&session.id, &session, &peeked_snapshot, &state.config);
     if let Some(list_message_id) = session.message_id {
         bot.edit_message_text(chat_id, list_message_id, text)
             .reply_markup(kb)
@@ -1836,6 +1848,10 @@ async fn handle_finish_title_response(
     } else {
         let sent = bot.send_message(chat_id, text).reply_markup(kb).await?;
         session.message_id = Some(sent.id);
+    }
+    if let Err(err) = send_embedded_media_for_view(bot, chat_id, state, &session, &peeked_snapshot).await
+    {
+        error!("send embedded media failed: {:#}", err);
     }
     state
         .sessions
@@ -2215,7 +2231,7 @@ async fn handle_list_callback(
     }
 
     session.message_id = Some(message.id);
-    let (text, kb) = render_list_view(&session.id, &session, &peeked_snapshot);
+    let (text, kb) = render_list_view(&session.id, &session, &peeked_snapshot, &state.config);
     let session_clone = session.clone();
     state
         .sessions
@@ -2230,7 +2246,10 @@ async fn handle_list_callback(
     bot.edit_message_text(message.chat.id, message.id, text)
         .reply_markup(kb)
         .await?;
-    if let Err(err) = send_embedded_media_for_selected(&bot, message.chat.id, &state, &session_clone).await {
+    if let Err(err) =
+        send_embedded_media_for_view(&bot, message.chat.id, &state, &session_clone, &peeked_snapshot)
+            .await
+    {
         error!("send embedded media failed: {:#}", err);
     }
     bot.answer_callback_query(q.id).await?;
@@ -3260,6 +3279,28 @@ fn displayed_indices_for_view(
         ListView::Peek { mode, page } => peek_indices_for_session(session, peeked, mode, page),
         ListView::Selected { index, .. } => vec![index],
         ListView::FinishConfirm { index, .. } => vec![index],
+        ListView::DeleteConfirm { index, .. } => vec![index],
+        _ => Vec::new(),
+    }
+}
+
+fn embedded_lines_for_view(session: &ListSession, peeked: &HashSet<String>) -> Vec<String> {
+    match session.view {
+        ListView::Peek { mode, page } => peek_indices_for_session(session, peeked, mode, page)
+            .into_iter()
+            .filter_map(|index| session.entries.get(index))
+            .flat_map(|entry| entry.preview_lines())
+            .collect(),
+        ListView::Selected { index, .. } => session
+            .entries
+            .get(index)
+            .map(|entry| entry.display_lines())
+            .unwrap_or_default(),
+        ListView::FinishConfirm { index, .. } | ListView::DeleteConfirm { index, .. } => session
+            .entries
+            .get(index)
+            .map(|entry| entry.preview_lines())
+            .unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -3560,16 +3601,19 @@ fn render_list_view(
     session_id: &str,
     session: &ListSession,
     peeked: &HashSet<String>,
+    config: &Config,
 ) -> (String, InlineKeyboardMarkup) {
     match &session.view {
         ListView::Menu => build_menu_view(session_id, session),
-        ListView::Peek { mode, page } => build_peek_view(session_id, session, *mode, *page, peeked),
-        ListView::Selected { index, .. } => build_selected_view(session_id, session, *index),
+        ListView::Peek { mode, page } => {
+            build_peek_view(session_id, session, *mode, *page, peeked, config)
+        }
+        ListView::Selected { index, .. } => build_selected_view(session_id, session, *index, config),
         ListView::FinishConfirm { index, .. } => {
-            build_finish_confirm_view(session_id, session, *index)
+            build_finish_confirm_view(session_id, session, *index, config)
         }
         ListView::DeleteConfirm { step, index, .. } => {
-            build_delete_confirm_view(session_id, session, *index, *step)
+            build_delete_confirm_view(session_id, session, *index, *step, config)
         }
     }
 }
@@ -3634,6 +3678,7 @@ fn build_peek_view(
     mode: ListMode,
     page: usize,
     peeked: &HashSet<String>,
+    config: &Config,
 ) -> (String, InlineKeyboardMarkup) {
     let total_unpeeked = count_visible_entries(session, peeked);
     let indices = peek_indices_for_session(session, peeked, mode, page);
@@ -3666,7 +3711,7 @@ fn build_peek_view(
     } else {
         for (display_index, entry_index) in indices.iter().enumerate() {
             if let Some(entry) = session.entries.get(*entry_index) {
-                let preview = entry.preview_lines();
+                let preview = format_embedded_references_for_lines(&entry.preview_lines(), config);
                 text.push_str(&format!("{}) ", display_index + 1));
                 if let Some(first) = preview.get(0) {
                     text.push_str(first);
@@ -3719,10 +3764,11 @@ fn build_selected_view(
     session_id: &str,
     session: &ListSession,
     index: usize,
+    config: &Config,
 ) -> (String, InlineKeyboardMarkup) {
     let entry = session.entries.get(index);
     let text = if let Some(entry) = entry {
-        let lines = entry.display_lines();
+        let lines = format_embedded_references_for_lines(&entry.display_lines(), config);
         format!("Selected item:\n\n{}", lines.join("\n"))
     } else {
         "Selected item not found.".to_string()
@@ -3818,9 +3864,12 @@ fn build_finish_confirm_view(
     session_id: &str,
     session: &ListSession,
     index: usize,
+    config: &Config,
 ) -> (String, InlineKeyboardMarkup) {
     let entry = session.entries.get(index);
-    let preview = entry.map(|e| e.preview_lines()).unwrap_or_default();
+    let preview = entry
+        .map(|e| format_embedded_references_for_lines(&e.preview_lines(), config))
+        .unwrap_or_default();
     let mut text = String::from("Finish this item?\n\n");
     if let Some(first) = preview.get(0) {
         text.push_str(first);
@@ -3854,9 +3903,12 @@ fn build_delete_confirm_view(
     session: &ListSession,
     index: usize,
     step: u8,
+    config: &Config,
 ) -> (String, InlineKeyboardMarkup) {
     let entry = session.entries.get(index);
-    let preview = entry.map(|e| e.preview_lines()).unwrap_or_default();
+    let preview = entry
+        .map(|e| format_embedded_references_for_lines(&e.preview_lines(), config))
+        .unwrap_or_default();
     let mut text = format!("Confirm delete ({}/2)?\n\n", step);
     if let Some(first) = preview.get(0) {
         text.push_str(first);
@@ -4019,19 +4071,14 @@ async fn send_error(bot: &Bot, chat_id: ChatId, text: &str) -> Result<()> {
     Ok(())
 }
 
-async fn send_embedded_media_for_selected(
+async fn send_embedded_media_for_view(
     bot: &Bot,
     chat_id: ChatId,
     state: &std::sync::Arc<AppState>,
     session: &ListSession,
+    peeked: &HashSet<String>,
 ) -> Result<()> {
-    let ListView::Selected { index, .. } = session.view else {
-        return Ok(());
-    };
-    let Some(entry) = session.entries.get(index) else {
-        return Ok(());
-    };
-    let lines = entry.display_lines();
+    let lines = embedded_lines_for_view(session, peeked);
     let embeds = extract_embedded_paths(&lines, &state.config);
     for path in embeds {
         if is_image_path(&path) {
@@ -4497,6 +4544,56 @@ fn build_media_entry_text(filename: &str, caption: Option<&str>) -> String {
     text
 }
 
+fn format_embedded_references_for_lines(lines: &[String], config: &Config) -> Vec<String> {
+    let mut labels: HashMap<PathBuf, usize> = HashMap::new();
+    let mut next_label = 1usize;
+    let mut output = Vec::with_capacity(lines.len());
+
+    for line in lines {
+        let mut formatted = String::with_capacity(line.len());
+        let mut index = 0;
+        while let Some(start_rel) = line[index..].find("![[") {
+            let marker_start = index + start_rel;
+            formatted.push_str(&line[index..marker_start]);
+
+            let marker_content_start = marker_start + 3;
+            let Some(end_rel) = line[marker_content_start..].find("]]") else {
+                formatted.push_str(&line[marker_start..]);
+                index = line.len();
+                break;
+            };
+            let marker_content_end = marker_content_start + end_rel;
+            let marker_end = marker_content_end + 2;
+            let marker_inner = &line[marker_content_start..marker_content_end];
+
+            if let Some(path) = resolve_embedded_path(marker_inner, config) {
+                let label = match labels.get(&path) {
+                    Some(label) => *label,
+                    None => {
+                        let assigned = next_label;
+                        labels.insert(path.clone(), assigned);
+                        next_label += 1;
+                        assigned
+                    }
+                };
+                if is_image_path(&path) {
+                    formatted.push_str(&format!("image #{}", label));
+                } else {
+                    formatted.push_str(&format!("file #{}", label));
+                }
+            } else {
+                formatted.push_str(&line[marker_start..marker_end]);
+            }
+
+            index = marker_end;
+        }
+        formatted.push_str(&line[index..]);
+        output.push(formatted);
+    }
+
+    output
+}
+
 fn pick_best_photo(photos: &[teloxide::types::PhotoSize]) -> Option<&teloxide::types::PhotoSize> {
     photos.iter().max_by_key(|photo| {
         photo.file.size.max((photo.width * photo.height) as u32) as u64
@@ -4513,10 +4610,6 @@ async fn download_telegram_file(bot: &Bot, file_id: &str, dest_path: &Path) -> R
 fn extract_embedded_paths(lines: &[String], config: &Config) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
-    let vault_root = config
-        .read_later_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
     for line in lines {
         let mut index = 0;
         while let Some(start_rel) = line[index..].find("![[") {
@@ -4525,28 +4618,44 @@ fn extract_embedded_paths(lines: &[String], config: &Config) -> Vec<PathBuf> {
                 break;
             };
             let end = start + end_rel;
-            let mut inner = line[start..end].trim();
-            if let Some((path_part, _)) = inner.split_once('|') {
-                inner = path_part.trim();
-            }
-            if inner.is_empty() {
-                index = end + 2;
-                continue;
-            }
-            let path = if Path::new(inner).is_absolute() {
-                PathBuf::from(inner)
-            } else if inner.contains('/') || inner.contains('\\') {
-                vault_root.join(inner)
-            } else {
-                config.media_dir.join(inner)
-            };
-            if path.exists() && seen.insert(path.clone()) {
-                paths.push(path);
+            let inner = &line[start..end];
+            if let Some(path) = resolve_embedded_path(inner, config) {
+                if seen.insert(path.clone()) {
+                    paths.push(path);
+                }
             }
             index = end + 2;
         }
     }
     paths
+}
+
+fn resolve_embedded_path(inner: &str, config: &Config) -> Option<PathBuf> {
+    let mut inner = inner.trim();
+    if let Some((path_part, _)) = inner.split_once('|') {
+        inner = path_part.trim();
+    }
+    if inner.is_empty() {
+        return None;
+    }
+
+    let vault_root = config
+        .read_later_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let path = if Path::new(inner).is_absolute() {
+        PathBuf::from(inner)
+    } else if inner.contains('/') || inner.contains('\\') {
+        vault_root.join(inner)
+    } else {
+        config.media_dir.join(inner)
+    };
+
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 fn is_image_path(path: &Path) -> bool {
@@ -4633,6 +4742,20 @@ mod tests {
 
     fn entry(text: &str) -> EntryBlock {
         EntryBlock::from_text(text)
+    }
+
+    fn test_config() -> Config {
+        Config {
+            token: "token".to_string(),
+            user_id: 1,
+            read_later_path: PathBuf::from("/tmp/read-later.md"),
+            finished_path: PathBuf::from("/tmp/finished.md"),
+            resources_path: PathBuf::from("/tmp/resources"),
+            media_dir: PathBuf::from("/tmp/media"),
+            data_dir: PathBuf::from("/tmp/data"),
+            retry_interval_seconds: None,
+            sync: None,
+        }
     }
 
     #[test]
@@ -4750,8 +4873,50 @@ mod tests {
         for entry in &entries {
             peeked.insert(entry.block_string());
         }
-        let (text, _kb) = build_peek_view("session", &session, ListMode::Top, 0, &peeked);
+        let config = test_config();
+        let (text, _kb) = build_peek_view("session", &session, ListMode::Top, 0, &peeked, &config);
         assert!(text.contains("Everything's been peeked already."));
+    }
+
+    #[test]
+    fn format_embedded_references_labels_images_and_files() {
+        let temp = TempDir::new().unwrap();
+        let media_dir = temp.path().join("media");
+        fs::create_dir_all(&media_dir).unwrap();
+        fs::write(media_dir.join("image-1.jpg"), b"x").unwrap();
+        fs::write(media_dir.join("doc-1.pdf"), b"x").unwrap();
+
+        let mut config = test_config();
+        config.media_dir = media_dir;
+
+        let lines = vec![
+            "![[image-1.jpg]] and ![[doc-1.pdf]]".to_string(),
+            "repeat ![[image-1.jpg]]".to_string(),
+        ];
+        let rendered = format_embedded_references_for_lines(&lines, &config);
+
+        assert_eq!(rendered[0], "image #1 and file #2");
+        assert_eq!(rendered[1], "repeat image #1");
+    }
+
+    #[test]
+    fn embedded_lines_for_peek_use_preview_only() {
+        let entry = EntryBlock::from_text("first line\nsecond line\n![[image-2.jpg]]");
+        let session = ListSession {
+            id: "session".to_string(),
+            chat_id: 0,
+            kind: SessionKind::List,
+            entries: vec![entry],
+            view: ListView::Peek {
+                mode: ListMode::Top,
+                page: 0,
+            },
+            seen_random: HashSet::new(),
+            message_id: None,
+        };
+
+        let lines = embedded_lines_for_view(&session, &HashSet::new());
+        assert_eq!(lines, vec!["first line".to_string(), "second line...".to_string()]);
     }
 
     #[test]
