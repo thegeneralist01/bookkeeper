@@ -256,6 +256,7 @@ struct ListSession {
     view: ListView,
     seen_random: HashSet<usize>,
     message_id: Option<MessageId>,
+    sent_media_message_ids: Vec<MessageId>,
 }
 
 #[derive(Clone, Debug)]
@@ -722,7 +723,8 @@ async fn handle_norm_message(
                 session.message_id = Some(sent.id);
             }
             if let Err(err) =
-                send_embedded_media_for_view(bot, chat_id, state, &session, &peeked_snapshot).await
+                refresh_embedded_media_for_view(bot, chat_id, state, &mut session, &peeked_snapshot)
+                    .await
             {
                 error!("send embedded media failed: {:#}", err);
             }
@@ -822,7 +824,8 @@ async fn handle_instant_delete_message(
                 session.message_id = Some(sent.id);
             }
             if let Err(err) =
-                send_embedded_media_for_view(bot, chat_id, state, &session, &peeked_snapshot).await
+                refresh_embedded_media_for_view(bot, chat_id, state, &mut session, &peeked_snapshot)
+                    .await
             {
                 error!("send embedded media failed: {:#}", err);
             }
@@ -900,6 +903,7 @@ async fn handle_list_command(
         view: ListView::Menu,
         seen_random: HashSet::new(),
         message_id: None,
+        sent_media_message_ids: Vec::new(),
     };
 
     let (text, kb) = build_menu_view(&session_id, &session);
@@ -949,6 +953,7 @@ async fn handle_search_command(
         },
         seen_random: HashSet::new(),
         message_id: None,
+        sent_media_message_ids: Vec::new(),
     };
 
     let peeked_snapshot = state.peeked.lock().await.clone();
@@ -1849,7 +1854,8 @@ async fn handle_finish_title_response(
         let sent = bot.send_message(chat_id, text).reply_markup(kb).await?;
         session.message_id = Some(sent.id);
     }
-    if let Err(err) = send_embedded_media_for_view(bot, chat_id, state, &session, &peeked_snapshot).await
+    if let Err(err) =
+        refresh_embedded_media_for_view(bot, chat_id, state, &mut session, &peeked_snapshot).await
     {
         error!("send embedded media failed: {:#}", err);
     }
@@ -1958,6 +1964,8 @@ async fn handle_list_callback(
         }
         "close" => {
             if matches!(&session.kind, SessionKind::Search { .. }) {
+                delete_embedded_media_messages(&bot, message.chat.id, &session.sent_media_message_ids)
+                    .await;
                 bot.delete_message(message.chat.id, message.id).await?;
                 let mut active = state.active_sessions.lock().await;
                 if active.get(&chat_id) == Some(&session.id) {
@@ -2232,26 +2240,25 @@ async fn handle_list_callback(
 
     session.message_id = Some(message.id);
     let (text, kb) = render_list_view(&session.id, &session, &peeked_snapshot, &state.config);
-    let session_clone = session.clone();
-    state
-        .sessions
-        .lock()
-        .await
-        .insert(session.id.clone(), session);
-    state
-        .active_sessions
-        .lock()
-        .await
-        .insert(chat_id, session_clone.id.clone());
     bot.edit_message_text(message.chat.id, message.id, text)
         .reply_markup(kb)
         .await?;
     if let Err(err) =
-        send_embedded_media_for_view(&bot, message.chat.id, &state, &session_clone, &peeked_snapshot)
+        refresh_embedded_media_for_view(&bot, message.chat.id, &state, &mut session, &peeked_snapshot)
             .await
     {
         error!("send embedded media failed: {:#}", err);
     }
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.id.clone(), session.clone());
+    state
+        .active_sessions
+        .lock()
+        .await
+        .insert(chat_id, session.id.clone());
     bot.answer_callback_query(q.id).await?;
     Ok(())
 }
@@ -4077,16 +4084,37 @@ async fn send_embedded_media_for_view(
     state: &std::sync::Arc<AppState>,
     session: &ListSession,
     peeked: &HashSet<String>,
-) -> Result<()> {
+) -> Result<Vec<MessageId>> {
     let lines = embedded_lines_for_view(session, peeked);
     let embeds = extract_embedded_paths(&lines, &state.config);
+    let mut sent_message_ids = Vec::new();
     for path in embeds {
         if is_image_path(&path) {
-            bot.send_photo(chat_id, InputFile::file(path)).await?;
+            let sent = bot.send_photo(chat_id, InputFile::file(path)).await?;
+            sent_message_ids.push(sent.id);
         } else {
-            bot.send_document(chat_id, InputFile::file(path)).await?;
+            let sent = bot.send_document(chat_id, InputFile::file(path)).await?;
+            sent_message_ids.push(sent.id);
         }
     }
+    Ok(sent_message_ids)
+}
+
+async fn delete_embedded_media_messages(bot: &Bot, chat_id: ChatId, message_ids: &[MessageId]) {
+    for message_id in message_ids {
+        let _ = bot.delete_message(chat_id, *message_id).await;
+    }
+}
+
+async fn refresh_embedded_media_for_view(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &std::sync::Arc<AppState>,
+    session: &mut ListSession,
+    peeked: &HashSet<String>,
+) -> Result<()> {
+    delete_embedded_media_messages(bot, chat_id, &session.sent_media_message_ids).await;
+    session.sent_media_message_ids = send_embedded_media_for_view(bot, chat_id, state, session, peeked).await?;
     Ok(())
 }
 
@@ -4837,6 +4865,7 @@ mod tests {
             },
             seen_random: HashSet::new(),
             message_id: None,
+            sent_media_message_ids: Vec::new(),
         };
         let mut peeked = HashSet::new();
         for entry in &entries {
@@ -4868,6 +4897,7 @@ mod tests {
             },
             seen_random: HashSet::new(),
             message_id: None,
+            sent_media_message_ids: Vec::new(),
         };
         let mut peeked = HashSet::new();
         for entry in &entries {
@@ -4913,6 +4943,7 @@ mod tests {
             },
             seen_random: HashSet::new(),
             message_id: None,
+            sent_media_message_ids: Vec::new(),
         };
 
         let lines = embedded_lines_for_view(&session, &HashSet::new());
@@ -4955,6 +4986,7 @@ mod tests {
             },
             seen_random: HashSet::new(),
             message_id: None,
+            sent_media_message_ids: Vec::new(),
         };
         let peeked = HashSet::new();
         assert_eq!(displayed_indices_for_view(&session, &peeked), vec![1]);
@@ -4976,6 +5008,7 @@ mod tests {
             },
             seen_random: HashSet::new(),
             message_id: None,
+            sent_media_message_ids: Vec::new(),
         };
         assert_eq!(norm_target_index(&session, &peeked), Some(1));
 
