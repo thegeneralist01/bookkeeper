@@ -587,34 +587,19 @@ async fn handle_media_message(
 
     if let Some(document) = msg.document() {
         let mime = document.mime_type.as_ref().map(|m| m.essence_str());
-        let is_media = if let Some(mime) = mime {
-            mime.starts_with("image/") || mime.starts_with("video/")
+        fs::create_dir_all(&media_dir)
+            .with_context(|| format!("create media dir {}", media_dir.display()))?;
+        let ext = mime.and_then(extension_from_mime);
+        let filename = if let Some(name) = document.file_name.as_deref() {
+            sanitize_filename_with_default(name, ext)
         } else {
-            document
-                .file_name
-                .as_deref()
-                .and_then(|name| Path::new(name).extension().and_then(|ext| ext.to_str()))
-                .map(|ext| matches!(
-                    ext.to_ascii_lowercase().as_str(),
-                    "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "mp4" | "mov" | "mkv"
-                ))
-                .unwrap_or(false)
+            format!("file-{}.{}", Uuid::new_v4(), ext.unwrap_or("bin"))
         };
-        if is_media {
-            fs::create_dir_all(&media_dir)
-                .with_context(|| format!("create media dir {}", media_dir.display()))?;
-            let ext = mime.and_then(extension_from_mime);
-            let filename = if let Some(name) = document.file_name.as_deref() {
-                sanitize_filename_with_default(name, ext)
-            } else {
-                format!("file-{}.{}", Uuid::new_v4(), ext.unwrap_or("bin"))
-            };
-            let dest_path = media_dir.join(&filename);
-            download_telegram_file(bot, &document.file.id, &dest_path).await?;
-            let entry_text = build_media_entry_text(&filename, caption.as_deref());
-            handle_single_item(bot.clone(), chat_id, state.clone(), &entry_text, Some(msg.id)).await?;
-            return Ok(true);
-        }
+        let dest_path = media_dir.join(&filename);
+        download_telegram_file(bot, &document.file.id, &dest_path).await?;
+        let entry_text = build_media_entry_text(&filename, caption.as_deref());
+        handle_single_item(bot.clone(), chat_id, state.clone(), &entry_text, Some(msg.id)).await?;
+        return Ok(true);
     }
 
     if let Some(video) = msg.video() {
