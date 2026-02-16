@@ -4077,6 +4077,9 @@ async fn send_embedded_media_for_view(
         if is_image_path(&path) {
             let sent = bot.send_photo(chat_id, InputFile::file(path)).await?;
             sent_message_ids.push(sent.id);
+        } else if is_video_path(&path) {
+            let sent = bot.send_video(chat_id, InputFile::file(path)).await?;
+            sent_message_ids.push(sent.id);
         } else {
             let sent = bot.send_document(chat_id, InputFile::file(path)).await?;
             sent_message_ids.push(sent.id);
@@ -4591,6 +4594,8 @@ fn format_embedded_references_for_lines(lines: &[String], config: &Config) -> Ve
                 };
                 if is_image_path(&path) {
                     formatted.push_str(&format!("image #{}", label));
+                } else if is_video_path(&path) {
+                    formatted.push_str(&format!("video #{}", label));
                 } else {
                     formatted.push_str(&format!("file #{}", label));
                 }
@@ -4676,6 +4681,16 @@ fn is_image_path(path: &Path) -> bool {
         Some(ext) => matches!(
             ext.to_ascii_lowercase().as_str(),
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+        ),
+        None => false,
+    }
+}
+
+fn is_video_path(path: &Path) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) => matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v"
         ),
         None => false,
     }
@@ -4912,6 +4927,22 @@ mod tests {
 
         assert_eq!(rendered[0], "image #1 and file #2");
         assert_eq!(rendered[1], "repeat image #1");
+    }
+
+    #[test]
+    fn format_embedded_references_labels_videos() {
+        let temp = TempDir::new().unwrap();
+        let media_dir = temp.path().join("media");
+        fs::create_dir_all(&media_dir).unwrap();
+        fs::write(media_dir.join("clip.mp4"), b"x").unwrap();
+
+        let mut config = test_config();
+        config.media_dir = media_dir;
+
+        let lines = vec!["Watch ![[clip.mp4]]".to_string()];
+        let rendered = format_embedded_references_for_lines(&lines, &config);
+
+        assert_eq!(rendered[0], "Watch video #1");
     }
 
     #[test]
