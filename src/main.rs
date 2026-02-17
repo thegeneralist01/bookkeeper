@@ -214,6 +214,29 @@ struct DownloadPickerState {
     chat_id: i64,
     message_id: MessageId,
     links: Vec<String>,
+    mode: DownloadPickerMode,
+}
+
+#[derive(Clone, Debug)]
+enum DownloadPickerMode {
+    Links,
+    Quality {
+        link_index: usize,
+        action: DownloadAction,
+        options: Vec<DownloadQualityOption>,
+    },
+}
+
+#[derive(Clone, Debug, Copy)]
+enum DownloadAction {
+    Send,
+    Save,
+}
+
+#[derive(Clone, Debug)]
+struct DownloadQualityOption {
+    label: String,
+    format_selector: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1556,6 +1579,7 @@ async fn start_download_picker(
         chat_id: chat_id.0,
         message_id: sent.id,
         links,
+        mode: DownloadPickerMode::Links,
     };
     state
         .download_pickers
@@ -1587,7 +1611,7 @@ async fn handle_download_callback(
         None => return Ok(()),
     };
 
-    let picker = {
+    let mut picker = {
         let mut pickers = state.download_pickers.lock().await;
         let picker = match pickers.remove(&picker_id) {
             Some(picker) => picker,
@@ -1609,16 +1633,154 @@ async fn handle_download_callback(
 
     match action {
         "send" => {
-            let index = parts.next().and_then(|p| p.parse::<usize>().ok());
-            if let Some(index) = index {
-                if let Some(link) = picker.links.get(index).cloned() {
-                    match download_and_send_link(&bot, message.chat.id, &link).await {
-                        Ok(()) => {
-                            let _ = bot.delete_message(message.chat.id, message.id).await;
+            if !matches!(picker.mode, DownloadPickerMode::Links) {
+                reinsert = true;
+            } else {
+                let index = parts.next().and_then(|p| p.parse::<usize>().ok());
+                if let Some(index) = index {
+                    if let Some(link) = picker.links.get(index).cloned() {
+                        let link_for_probe = link.clone();
+                        let options = tokio::task::spawn_blocking(move || {
+                            run_ytdlp_list_formats(&link_for_probe)
+                        })
+                        .await
+                        .context("yt-dlp formats task failed")?;
+                        match options {
+                            Ok(options) => {
+                                let text = build_download_quality_text(
+                                    &link,
+                                    DownloadAction::Send,
+                                    &options,
+                                );
+                                let kb =
+                                    build_download_quality_keyboard(&picker_id, &options);
+                                bot.edit_message_text(message.chat.id, message.id, text)
+                                    .reply_markup(kb)
+                                    .await?;
+                                picker.mode = DownloadPickerMode::Quality {
+                                    link_index: index,
+                                    action: DownloadAction::Send,
+                                    options,
+                                };
+                                reinsert = true;
+                            }
+                            Err(err) => {
+                                send_error(&bot, message.chat.id, &err.to_string()).await?;
+                                reinsert = true;
+                            }
                         }
-                        Err(err) => {
-                            send_error(&bot, message.chat.id, &err.to_string()).await?;
-                            reinsert = true;
+                    } else {
+                        reinsert = true;
+                    }
+                } else {
+                    reinsert = true;
+                }
+            }
+        }
+        "save" => {
+            if !matches!(picker.mode, DownloadPickerMode::Links) {
+                reinsert = true;
+            } else {
+                let index = parts.next().and_then(|p| p.parse::<usize>().ok());
+                if let Some(index) = index {
+                    if let Some(link) = picker.links.get(index).cloned() {
+                        let link_for_probe = link.clone();
+                        let options = tokio::task::spawn_blocking(move || {
+                            run_ytdlp_list_formats(&link_for_probe)
+                        })
+                        .await
+                        .context("yt-dlp formats task failed")?;
+                        match options {
+                            Ok(options) => {
+                                let text = build_download_quality_text(
+                                    &link,
+                                    DownloadAction::Save,
+                                    &options,
+                                );
+                                let kb =
+                                    build_download_quality_keyboard(&picker_id, &options);
+                                bot.edit_message_text(message.chat.id, message.id, text)
+                                    .reply_markup(kb)
+                                    .await?;
+                                picker.mode = DownloadPickerMode::Quality {
+                                    link_index: index,
+                                    action: DownloadAction::Save,
+                                    options,
+                                };
+                                reinsert = true;
+                            }
+                            Err(err) => {
+                                send_error(&bot, message.chat.id, &err.to_string()).await?;
+                                reinsert = true;
+                            }
+                        }
+                    } else {
+                        reinsert = true;
+                    }
+                } else {
+                    reinsert = true;
+                }
+            }
+        }
+        "quality" => {
+            let selected = parts.next().and_then(|p| p.parse::<usize>().ok());
+            if let (
+                Some(selected),
+                DownloadPickerMode::Quality {
+                    link_index,
+                    action,
+                    options,
+                },
+            ) = (selected, &picker.mode)
+            {
+                if let (Some(link), Some(option)) =
+                    (picker.links.get(*link_index).cloned(), options.get(selected).cloned())
+                {
+                    match action {
+                        DownloadAction::Send => {
+                            match download_and_send_link(
+                                &bot,
+                                message.chat.id,
+                                &link,
+                                &option.format_selector,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    let _ = bot.delete_message(message.chat.id, message.id).await;
+                                }
+                                Err(err) => {
+                                    send_error(&bot, message.chat.id, &err.to_string()).await?;
+                                    reinsert = true;
+                                }
+                            }
+                        }
+                        DownloadAction::Save => {
+                            match download_and_save_link(
+                                &state,
+                                &link,
+                                &option.format_selector,
+                            )
+                            .await
+                            {
+                                Ok(path) => {
+                                    let note = format!("Saved to {}", path.display());
+                                    let kb = InlineKeyboardMarkup::new(vec![vec![
+                                        InlineKeyboardButton::callback(
+                                            "Delete message",
+                                            "msgdel",
+                                        ),
+                                    ]]);
+                                    bot.send_message(message.chat.id, note)
+                                        .reply_markup(kb)
+                                        .await?;
+                                    let _ = bot.delete_message(message.chat.id, message.id).await;
+                                }
+                                Err(err) => {
+                                    send_error(&bot, message.chat.id, &err.to_string()).await?;
+                                    reinsert = true;
+                                }
+                            }
                         }
                     }
                 } else {
@@ -1628,52 +1790,42 @@ async fn handle_download_callback(
                 reinsert = true;
             }
         }
-        "save" => {
-            let index = parts.next().and_then(|p| p.parse::<usize>().ok());
-            if let Some(index) = index {
-                if let Some(link) = picker.links.get(index).cloned() {
-                    match download_and_save_link(&state, &link).await {
-                        Ok(path) => {
-                            let note = format!("Saved to {}", path.display());
-                            let kb = InlineKeyboardMarkup::new(vec![vec![
-                                InlineKeyboardButton::callback("Delete message", "msgdel"),
-                            ]]);
-                            bot.send_message(message.chat.id, note)
-                                .reply_markup(kb)
-                                .await?;
-                            let _ = bot.delete_message(message.chat.id, message.id).await;
-                        }
-                        Err(err) => {
-                            send_error(&bot, message.chat.id, &err.to_string()).await?;
-                            reinsert = true;
-                        }
-                    }
-                } else {
-                    reinsert = true;
-                }
+        "back" => {
+            if matches!(picker.mode, DownloadPickerMode::Quality { .. }) {
+                let text = build_download_picker_text(&picker.links);
+                let kb = build_download_picker_keyboard(&picker_id, &picker.links);
+                bot.edit_message_text(message.chat.id, message.id, text)
+                    .reply_markup(kb)
+                    .await?;
+                picker.mode = DownloadPickerMode::Links;
+                reinsert = true;
             } else {
                 reinsert = true;
             }
         }
         "add" => {
-            let prompt_text = "Send a link to add.";
-            let sent = bot.send_message(message.chat.id, prompt_text).await?;
-            let prompt = DownloadLinkPrompt {
-                links: picker.links.clone(),
-                prompt_message_id: sent.id,
-                expires_at: now_ts() + DOWNLOAD_PROMPT_TTL_SECS,
-            };
-            let previous = state
-                .download_link_prompts
-                .lock()
-                .await
-                .insert(message.chat.id.0, prompt);
-            if let Some(previous) = previous {
-                let _ = bot
-                    .delete_message(message.chat.id, previous.prompt_message_id)
-                    .await;
+            if matches!(picker.mode, DownloadPickerMode::Links) {
+                let prompt_text = "Send a link to add.";
+                let sent = bot.send_message(message.chat.id, prompt_text).await?;
+                let prompt = DownloadLinkPrompt {
+                    links: picker.links.clone(),
+                    prompt_message_id: sent.id,
+                    expires_at: now_ts() + DOWNLOAD_PROMPT_TTL_SECS,
+                };
+                let previous = state
+                    .download_link_prompts
+                    .lock()
+                    .await
+                    .insert(message.chat.id.0, prompt);
+                if let Some(previous) = previous {
+                    let _ = bot
+                        .delete_message(message.chat.id, previous.prompt_message_id)
+                        .await;
+                }
+                let _ = bot.delete_message(message.chat.id, message.id).await;
+            } else {
+                reinsert = true;
             }
-            let _ = bot.delete_message(message.chat.id, message.id).await;
         }
         "cancel" => {
             let _ = bot.delete_message(message.chat.id, message.id).await;
@@ -3170,11 +3322,19 @@ fn split_items(text: &str) -> Vec<String> {
         .collect()
 }
 
-async fn download_and_send_link(bot: &Bot, chat_id: ChatId, link: &str) -> Result<()> {
+async fn download_and_send_link(
+    bot: &Bot,
+    chat_id: ChatId,
+    link: &str,
+    format_selector: &str,
+) -> Result<()> {
     let temp_dir = TempDir::new().context("create download temp dir")?;
     let target_dir = temp_dir.path().to_path_buf();
     let link = link.to_string();
-    let path = tokio::task::spawn_blocking(move || run_ytdlp_download(&target_dir, &link))
+    let format_selector = format_selector.to_string();
+    let path = tokio::task::spawn_blocking(move || {
+        run_ytdlp_download(&target_dir, &link, &format_selector)
+    })
         .await
         .context("yt-dlp task failed")??;
     bot.send_document(chat_id, InputFile::file(path)).await?;
@@ -3184,12 +3344,16 @@ async fn download_and_send_link(bot: &Bot, chat_id: ChatId, link: &str) -> Resul
 async fn download_and_save_link(
     state: &std::sync::Arc<AppState>,
     link: &str,
+    format_selector: &str,
 ) -> Result<PathBuf> {
     let target_dir = state.config.media_dir.clone();
     fs::create_dir_all(&target_dir)
         .with_context(|| format!("create media dir {}", target_dir.display()))?;
     let link = link.to_string();
-    let path = tokio::task::spawn_blocking(move || run_ytdlp_download(&target_dir, &link))
+    let format_selector = format_selector.to_string();
+    let path = tokio::task::spawn_blocking(move || {
+        run_ytdlp_download(&target_dir, &link, &format_selector)
+    })
         .await
         .context("yt-dlp task failed")??;
     if !path.exists() {
@@ -3198,10 +3362,148 @@ async fn download_and_save_link(
     Ok(path)
 }
 
-fn run_ytdlp_download(target_dir: &Path, link: &str) -> Result<PathBuf> {
+fn run_ytdlp_list_formats(link: &str) -> Result<Vec<DownloadQualityOption>> {
+    let output = Command::new("yt-dlp")
+        .arg("--no-playlist")
+        .arg("-J")
+        .arg(link)
+        .output()
+        .context("run yt-dlp")?;
+    if !output.status.success() {
+        return Err(anyhow!(format_ytdlp_error(&output)));
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parse yt-dlp json")?;
+    let mut options = vec![DownloadQualityOption {
+        label: "Best".to_string(),
+        format_selector: "bestvideo+bestaudio/best".to_string(),
+    }];
+
+    let Some(formats) = value.get("formats").and_then(|v| v.as_array()) else {
+        return Ok(options);
+    };
+
+    let mut by_height: HashMap<i64, (String, String, Option<u64>, bool)> = HashMap::new();
+    let mut best_audio: Option<(String, String, Option<u64>, Option<f64>)> = None;
+
+    for format in formats {
+        let Some(format_id) = format.get("format_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let vcodec = format.get("vcodec").and_then(|v| v.as_str()).unwrap_or("none");
+        let acodec = format.get("acodec").and_then(|v| v.as_str()).unwrap_or("none");
+        let ext = format
+            .get("ext")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let filesize = format
+            .get("filesize")
+            .and_then(|v| v.as_u64())
+            .or_else(|| format.get("filesize_approx").and_then(|v| v.as_u64()));
+
+        if vcodec == "none" && acodec != "none" {
+            let abr = format.get("abr").and_then(|v| v.as_f64());
+            match &best_audio {
+                Some((_, _, existing_size, existing_abr)) => {
+                    let better_abr = abr.unwrap_or(0.0) > existing_abr.unwrap_or(0.0);
+                    let better_size = filesize.unwrap_or(0) > existing_size.unwrap_or(0);
+                    if better_abr || better_size {
+                        best_audio = Some((format_id.to_string(), ext, filesize, abr));
+                    }
+                }
+                None => {
+                    best_audio = Some((format_id.to_string(), ext, filesize, abr));
+                }
+            }
+            continue;
+        }
+
+        if vcodec == "none" {
+            continue;
+        }
+
+        let Some(height) = format.get("height").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        if height <= 0 {
+            continue;
+        }
+
+        let has_audio = acodec != "none";
+        let selector = if has_audio {
+            format_id.to_string()
+        } else {
+            format!("{}+bestaudio/best", format_id)
+        };
+        let candidate = (selector, ext, filesize, has_audio);
+        match by_height.get(&height) {
+            Some((_, _, existing_size, existing_has_audio)) => {
+                let better_audio = has_audio && !existing_has_audio;
+                let better_size = filesize.unwrap_or(0) > existing_size.unwrap_or(0);
+                if better_audio || better_size {
+                    by_height.insert(height, candidate);
+                }
+            }
+            None => {
+                by_height.insert(height, candidate);
+            }
+        }
+    }
+
+    let mut heights: Vec<i64> = by_height.keys().copied().collect();
+    heights.sort_by(|a, b| b.cmp(a));
+    for height in heights.into_iter().take(6) {
+        if let Some((selector, ext, size, has_audio)) = by_height.get(&height) {
+            let mut label = format!("{}p {}", height, ext);
+            if !has_audio {
+                label.push_str(" (video-only source)");
+            }
+            if let Some(size) = size {
+                label.push_str(&format!(" ({})", human_size(*size)));
+            }
+            options.push(DownloadQualityOption {
+                label,
+                format_selector: selector.clone(),
+            });
+        }
+    }
+
+    if let Some((format_id, ext, size, _abr)) = best_audio {
+        let mut label = format!("Audio only ({})", ext);
+        if let Some(size) = size {
+            label.push_str(&format!(" ({})", human_size(size)));
+        }
+        options.push(DownloadQualityOption {
+            label,
+            format_selector: format_id,
+        });
+    }
+
+    Ok(options)
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{:.1} {}", value, UNITS[unit])
+    }
+}
+
+fn run_ytdlp_download(target_dir: &Path, link: &str, format_selector: &str) -> Result<PathBuf> {
     let template = target_dir.join("%(title).200B-%(id)s.%(ext)s");
     let output = Command::new("yt-dlp")
         .arg("--no-playlist")
+        .arg("-f")
+        .arg(format_selector)
         .arg("--print")
         .arg("after_move:filepath")
         .arg("-o")
@@ -3561,6 +3863,22 @@ fn build_download_picker_text(links: &[String]) -> String {
     text.trim_end().to_string()
 }
 
+fn build_download_quality_text(
+    link: &str,
+    action: DownloadAction,
+    options: &[DownloadQualityOption],
+) -> String {
+    let action_label = match action {
+        DownloadAction::Send => "send",
+        DownloadAction::Save => "save",
+    };
+    let mut text = format!("Choose quality to {}:\n{}\n\n", action_label, link);
+    for (idx, option) in options.iter().enumerate() {
+        text.push_str(&format!("{}: {}\n", idx + 1, option.label));
+    }
+    text.trim_end().to_string()
+}
+
 fn build_download_picker_keyboard(
     picker_id: &str,
     links: &[String],
@@ -3581,6 +3899,28 @@ fn build_download_picker_keyboard(
     rows.push(vec![InlineKeyboardButton::callback(
         "Add link",
         format!("dl:{}:add", picker_id),
+    )]);
+    rows.push(vec![InlineKeyboardButton::callback(
+        "Cancel",
+        format!("dl:{}:cancel", picker_id),
+    )]);
+    InlineKeyboardMarkup::new(rows)
+}
+
+fn build_download_quality_keyboard(
+    picker_id: &str,
+    options: &[DownloadQualityOption],
+) -> InlineKeyboardMarkup {
+    let mut rows = Vec::new();
+    for (idx, option) in options.iter().enumerate() {
+        rows.push(vec![InlineKeyboardButton::callback(
+            option.label.clone(),
+            format!("dl:{}:quality:{}", picker_id, idx),
+        )]);
+    }
+    rows.push(vec![InlineKeyboardButton::callback(
+        "Back",
+        format!("dl:{}:back", picker_id),
     )]);
     rows.push(vec![InlineKeyboardButton::callback(
         "Cancel",
@@ -4943,6 +5283,35 @@ mod tests {
         let rendered = format_embedded_references_for_lines(&lines, &config);
 
         assert_eq!(rendered[0], "Watch video #1");
+    }
+
+    #[test]
+    fn human_size_formats_units() {
+        assert_eq!(human_size(999), "999 B");
+        assert_eq!(human_size(2048), "2.0 KB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn build_download_quality_text_lists_options() {
+        let options = vec![
+            DownloadQualityOption {
+                label: "Best".to_string(),
+                format_selector: "bestvideo+bestaudio/best".to_string(),
+            },
+            DownloadQualityOption {
+                label: "720p mp4".to_string(),
+                format_selector: "22".to_string(),
+            },
+        ];
+        let text = build_download_quality_text(
+            "https://example.com/video",
+            DownloadAction::Send,
+            &options,
+        );
+        assert!(text.contains("Choose quality to send"));
+        assert!(text.contains("1: Best"));
+        assert!(text.contains("2: 720p mp4"));
     }
 
     #[test]
