@@ -32,9 +32,9 @@ pip install -r requirements.txt
 
 - A few things to know before running the script:
     - It will create a `bookmarks.txt` file with the URLs of your bookmarks.
-    - The script fetches about 90 bookmarks per run. That means you might want to continually run it until you have no cookies left.
-        - A run writes (appends, really) URLs in a descending order (newest first).
-    - It might ask you whether to prepend or append the URLs - whether a new run should add URLs to the start or end of the file. **Generally, for a linear timeline, you want to append,** so: `a`.
+    - The script reads all paginated bookmark responses and, by default, keeps running until there are no bookmarks left.
+    - Write mode defaults to append (`a`) so new runs continue the timeline in order (newest first to oldest).
+      - If needed, you can still choose interactively with `python main.py --mode ask`.
     - It will take some time in the end to **unbookmark** the fetched bookmarks. Each time 10 new bookmarks are unbookmarked, it will print a message.
 
 - Run the script until you have all your bookmarks extracted:
