@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
@@ -26,6 +26,7 @@ const RESOURCE_PROMPT_TTL_SECS: u64 = 5 * 60;
 const PAGE_SIZE: usize = 3;
 const DOWNLOAD_PROMPT_TTL_SECS: u64 = 5 * 60;
 const FINISH_TITLE_PROMPT_TTL_SECS: u64 = 5 * 60;
+const SYNC_X_PROMPT_TTL_SECS: u64 = 10 * 60;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -38,6 +39,7 @@ struct Config {
     data_dir: PathBuf,
     retry_interval_seconds: Option<u64>,
     sync: Option<SyncConfig>,
+    sync_x: Option<SyncXConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -51,6 +53,7 @@ struct ConfigFile {
     data_dir: PathBuf,
     retry_interval_seconds: Option<u64>,
     sync: Option<SyncConfig>,
+    sync_x: Option<SyncXConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -65,6 +68,15 @@ enum UserIdInput {
 struct SyncConfig {
     repo_path: PathBuf,
     token_file: PathBuf,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct SyncXConfig {
+    source_project_path: PathBuf,
+    #[serde(default)]
+    work_dir: Option<PathBuf>,
+    #[serde(default)]
+    python_bin: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -258,6 +270,12 @@ struct FinishTitlePrompt {
 }
 
 #[derive(Clone, Debug)]
+struct SyncXCookiePrompt {
+    prompt_message_id: MessageId,
+    expires_at: u64,
+}
+
+#[derive(Clone, Debug)]
 struct UndoSession {
     chat_id: i64,
     message_id: MessageId,
@@ -319,6 +337,7 @@ struct AppState {
     download_pickers: Mutex<HashMap<String, DownloadPickerState>>,
     download_link_prompts: Mutex<HashMap<i64, DownloadLinkPrompt>>,
     finish_title_prompts: Mutex<HashMap<i64, FinishTitlePrompt>>,
+    sync_x_cookie_prompts: Mutex<HashMap<i64, SyncXCookiePrompt>>,
     queue: Mutex<Vec<QueuedOp>>,
     undo: Mutex<Vec<UndoRecord>>,
     queue_path: PathBuf,
@@ -366,6 +385,7 @@ async fn main() -> Result<()> {
         download_pickers: Mutex::new(HashMap::new()),
         download_link_prompts: Mutex::new(HashMap::new()),
         finish_title_prompts: Mutex::new(HashMap::new()),
+        sync_x_cookie_prompts: Mutex::new(HashMap::new()),
         queue: Mutex::new(load_queue(&queue_path)?),
         undo: Mutex::new(undo),
         queue_path,
@@ -495,6 +515,32 @@ async fn handle_message(
         return Ok(());
     }
 
+    let mut expired_sync_x_prompt: Option<SyncXCookiePrompt> = None;
+    let pending_sync_x_prompt = {
+        let mut prompts = state.sync_x_cookie_prompts.lock().await;
+        if let Some(prompt) = prompts.remove(&msg.chat.id.0) {
+            if prompt.expires_at > now_ts() {
+                Some(prompt)
+            } else {
+                expired_sync_x_prompt = Some(prompt);
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    if let Some(prompt) = expired_sync_x_prompt {
+        let _ = bot
+            .delete_message(msg.chat.id, prompt.prompt_message_id)
+            .await;
+    }
+
+    if let Some(prompt) = pending_sync_x_prompt {
+        handle_sync_x_cookie_response(&bot, msg.chat.id, msg.id, &state, &text, prompt).await?;
+        return Ok(());
+    }
+
     if let Some(cmd) = parse_command(&text) {
         let rest = text
             .splitn(2, |c: char| c.is_whitespace())
@@ -503,7 +549,7 @@ async fn handle_message(
             .trim();
         match cmd {
             "start" | "help" => {
-                let help = "Send any text to save it. Commands: /add <text>, /list, /search <query>, /download [url], /undos, /reset_peeked, /pull, /pull theirs, /push, /sync. Use --- to split a message into multiple items. In list views, use buttons for Mark Finished, Add Resource, Delete, Random. Quick actions: reply with del/delete to remove the current item, or send norm to normalize links.";
+                let help = "Send any text to save it. Commands: /add <text>, /list, /search <query>, /download [url], /undos, /reset_peeked, /pull, /pull theirs, /push, /sync, /sync_x. Use --- to split a message into multiple items. In list views, use buttons for Mark Finished, Add Resource, Delete, Random. Quick actions: reply with del/delete to remove the current item, or send norm to normalize links.";
                 bot.send_message(msg.chat.id, help).await?;
                 return Ok(());
             }
@@ -556,6 +602,11 @@ async fn handle_message(
             }
             "sync" => {
                 handle_sync_command(bot.clone(), msg.clone(), state).await?;
+                let _ = bot.delete_message(msg.chat.id, msg.id).await;
+                return Ok(());
+            }
+            "sync_x" => {
+                handle_sync_x_command(bot.clone(), msg.clone(), state).await?;
                 let _ = bot.delete_message(msg.chat.id, msg.id).await;
                 return Ok(());
             }
@@ -1144,6 +1195,86 @@ async fn handle_sync_command(
         }
         Err(err) => {
             send_error(&bot, chat_id, &err.to_string()).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_sync_x_command(
+    bot: Bot,
+    msg: Message,
+    state: std::sync::Arc<AppState>,
+) -> Result<()> {
+    if state.config.sync_x.is_none() {
+        send_error(
+            &bot,
+            msg.chat.id,
+            "sync_x not configured. Set settings.sync_x.source_project_path (and optionally settings.sync_x.python_bin/work_dir).",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let prompt_text = "Paste the Cloudflare cookie header string from x.com (must include auth_token and ct0).";
+    let sent = bot.send_message(msg.chat.id, prompt_text).await?;
+    state.sync_x_cookie_prompts.lock().await.insert(
+        msg.chat.id.0,
+        SyncXCookiePrompt {
+            prompt_message_id: sent.id,
+            expires_at: now_ts() + SYNC_X_PROMPT_TTL_SECS,
+        },
+    );
+    Ok(())
+}
+
+async fn handle_sync_x_cookie_response(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: MessageId,
+    state: &std::sync::Arc<AppState>,
+    text: &str,
+    prompt: SyncXCookiePrompt,
+) -> Result<()> {
+    let cookie_header = text.trim();
+    if cookie_header.is_empty() {
+        send_error(bot, chat_id, "Cookie header is empty. Paste the full header string.").await?;
+        state.sync_x_cookie_prompts.lock().await.insert(
+            chat_id.0,
+            SyncXCookiePrompt {
+                prompt_message_id: prompt.prompt_message_id,
+                expires_at: now_ts() + SYNC_X_PROMPT_TTL_SECS,
+            },
+        );
+        let _ = bot.delete_message(chat_id, message_id).await;
+        return Ok(());
+    }
+
+    let _ = bot.delete_message(chat_id, prompt.prompt_message_id).await;
+    let _ = bot.delete_message(chat_id, message_id).await;
+
+    let status_msg = bot.send_message(chat_id, "Syncing X bookmarks...").await?;
+    let config = state.config.clone();
+    let cookie_header = cookie_header.to_string();
+    let outcome = tokio::task::spawn_blocking(move || run_sync_x(&config, &cookie_header))
+        .await
+        .context("sync_x task failed")?;
+    let _ = bot.delete_message(chat_id, status_msg.id).await;
+
+    match outcome {
+        Ok(sync_outcome) => {
+            if sync_outcome.extracted_count == 0 {
+                send_ephemeral(bot, chat_id, "No X bookmarks found.", ACK_TTL_SECS).await?;
+            } else {
+                let text = format!(
+                    "X sync complete: extracted {}, added {}, skipped {} duplicates.",
+                    sync_outcome.extracted_count, sync_outcome.added_count, sync_outcome.duplicate_count
+                );
+                bot.send_message(chat_id, text).await?;
+            }
+        }
+        Err(err) => {
+            send_error(bot, chat_id, &format!("sync_x failed: {}", err)).await?;
         }
     }
 
@@ -2852,6 +2983,13 @@ enum SyncOutcome {
     Synced,
 }
 
+#[derive(Debug)]
+struct SyncXOutcome {
+    extracted_count: usize,
+    added_count: usize,
+    duplicate_count: usize,
+}
+
 async fn queue_op(state: &std::sync::Arc<AppState>, op: QueuedOp) -> Result<()> {
     let mut queue = state.queue.lock().await;
     queue.push(op);
@@ -3153,6 +3291,233 @@ fn run_sync(sync: &SyncConfig) -> Result<SyncOutcome> {
     } else {
         Ok(SyncOutcome::NoChanges)
     }
+}
+
+fn run_sync_x(config: &Config, cookie_header: &str) -> Result<SyncXOutcome> {
+    let sync_x = config
+        .sync_x
+        .as_ref()
+        .ok_or_else(|| anyhow!("sync_x is not configured."))?;
+
+    let source_project = &sync_x.source_project_path;
+    if !source_project.exists() {
+        return Err(anyhow!(
+            "sync_x source project path not found: {}",
+            source_project.display()
+        ));
+    }
+    if !source_project.is_dir() {
+        return Err(anyhow!(
+            "sync_x source project path is not a directory: {}",
+            source_project.display()
+        ));
+    }
+
+    let work_dir = sync_x
+        .work_dir
+        .clone()
+        .unwrap_or_else(|| config.data_dir.join("sync-x"));
+    prepare_sync_x_workspace(source_project, &work_dir)?;
+
+    let python_bin = resolve_sync_x_python_bin(sync_x);
+    let creds_path = work_dir.join("creds.txt");
+    let bookmarks_path = work_dir.join("bookmarks.txt");
+    let _ = fs::remove_file(&creds_path);
+    let _ = fs::remove_file(&bookmarks_path);
+
+    run_python_script(
+        &python_bin,
+        &work_dir,
+        "isolate_cookies.py",
+        &[],
+        Some(cookie_header),
+    )?;
+    run_python_script(&python_bin, &work_dir, "main.py", &["--mode", "a"], None)?;
+
+    let urls = if bookmarks_path.exists() {
+        read_sync_x_urls(&bookmarks_path)?
+    } else {
+        Vec::new()
+    };
+    let (added_count, duplicate_count) = prepend_urls_to_read_later_sync(&config.read_later_path, &urls)?;
+
+    let _ = fs::remove_file(&bookmarks_path);
+    let _ = fs::remove_file(&creds_path);
+
+    Ok(SyncXOutcome {
+        extracted_count: urls.len(),
+        added_count,
+        duplicate_count,
+    })
+}
+
+fn resolve_sync_x_python_bin(sync_x: &SyncXConfig) -> PathBuf {
+    if let Some(path) = &sync_x.python_bin {
+        return path.clone();
+    }
+    let venv_python3 = sync_x.source_project_path.join(".venv/bin/python3");
+    if venv_python3.exists() {
+        return venv_python3;
+    }
+    let venv_python = sync_x.source_project_path.join(".venv/bin/python");
+    if venv_python.exists() {
+        return venv_python;
+    }
+    PathBuf::from("python3")
+}
+
+fn prepare_sync_x_workspace(source_project: &Path, work_dir: &Path) -> Result<()> {
+    fs::create_dir_all(work_dir)
+        .with_context(|| format!("create sync_x work dir {}", work_dir.display()))?;
+
+    for file in [
+        "main.py",
+        "isolate_cookies.py",
+        "requirements.txt",
+        "README.md",
+        "LICENSE",
+    ] {
+        let src = source_project.join(file);
+        let dest = work_dir.join(file);
+        if !src.exists() {
+            if matches!(file, "main.py" | "isolate_cookies.py") {
+                return Err(anyhow!(
+                    "sync_x source is missing required file: {}",
+                    src.display()
+                ));
+            }
+            continue;
+        }
+        fs::copy(&src, &dest)
+            .with_context(|| format!("copy {} to {}", src.display(), dest.display()))?;
+    }
+
+    Ok(())
+}
+
+fn run_python_script(
+    python_bin: &Path,
+    work_dir: &Path,
+    script: &str,
+    args: &[&str],
+    stdin_input: Option<&str>,
+) -> Result<()> {
+    let mut cmd = Command::new(python_bin);
+    cmd.current_dir(work_dir)
+        .arg(script)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if stdin_input.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("run {} {}", python_bin.display(), script))?;
+    if let Some(input) = stdin_input {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(input.as_bytes())
+                .context("write stdin to python script")?;
+            if !input.ends_with('\n') {
+                stdin
+                    .write_all(b"\n")
+                    .context("write newline to python script")?;
+            }
+        }
+    }
+
+    let output = child.wait_with_output().context("wait for python script")?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let tail = summarize_process_output(&stdout, &stderr);
+        return Err(anyhow!(
+            "{} {} failed (status {}):\n{}",
+            python_bin.display(),
+            script,
+            output.status,
+            tail
+        ));
+    }
+    Ok(())
+}
+
+fn summarize_process_output(stdout: &str, stderr: &str) -> String {
+    let stderr_trimmed = stderr.trim();
+    if !stderr_trimmed.is_empty() {
+        return trim_tail(stderr_trimmed, 1200);
+    }
+    let stdout_trimmed = stdout.trim();
+    if !stdout_trimmed.is_empty() {
+        return trim_tail(stdout_trimmed, 1200);
+    }
+    "No output captured.".to_string()
+}
+
+fn trim_tail(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    let mut cutoff = 0usize;
+    for (idx, _) in text.char_indices() {
+        if idx >= text.len().saturating_sub(max_chars) {
+            cutoff = idx;
+            break;
+        }
+    }
+    format!("...{}", &text[cutoff..])
+}
+
+fn read_sync_x_urls(path: &Path) -> Result<Vec<String>> {
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("read bookmarks file {}", path.display()))?;
+    let mut seen = HashSet::new();
+    let mut urls = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            urls.push(trimmed.to_string());
+        }
+    }
+    Ok(urls)
+}
+
+fn prepend_urls_to_read_later_sync(path: &Path, urls: &[String]) -> Result<(usize, usize)> {
+    let (preamble, mut entries) = read_entries(path)?;
+    let mut existing = HashSet::new();
+    for entry in &entries {
+        existing.insert(entry.block_string());
+    }
+
+    let mut new_entries = Vec::new();
+    let mut duplicate_count = 0usize;
+    for url in urls {
+        let entry = EntryBlock::from_text(url);
+        let block = entry.block_string();
+        if existing.insert(block) {
+            new_entries.push(entry);
+        } else {
+            duplicate_count += 1;
+        }
+    }
+
+    if !new_entries.is_empty() {
+        for entry in new_entries.iter().rev() {
+            entries.insert(0, entry.clone());
+        }
+        write_entries(path, &preamble, &entries)?;
+    }
+
+    Ok((new_entries.len(), duplicate_count))
 }
 
 struct GitOutput {
@@ -4543,6 +4908,17 @@ fn load_config(path: &Path) -> Result<Config> {
         .unwrap_or_else(|| Path::new("."))
         .join("Misc/images_misc");
     let media_dir = config_file.media_dir.unwrap_or(default_media_dir);
+    let sync_x = config_file.sync_x.map(|sync_x| SyncXConfig {
+        source_project_path: resolve_user_id_path(&sync_x.source_project_path, config_dir),
+        work_dir: sync_x
+            .work_dir
+            .as_ref()
+            .map(|p| resolve_user_id_path(p, config_dir)),
+        python_bin: sync_x
+            .python_bin
+            .as_ref()
+            .map(|p| resolve_user_id_path(p, config_dir)),
+    });
     Ok(Config {
         token: config_file.token,
         user_id,
@@ -4553,6 +4929,7 @@ fn load_config(path: &Path) -> Result<Config> {
         data_dir: config_file.data_dir,
         retry_interval_seconds: config_file.retry_interval_seconds,
         sync: config_file.sync,
+        sync_x,
     })
 }
 
@@ -5123,6 +5500,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/data"),
             retry_interval_seconds: None,
             sync: None,
+            sync_x: None,
         }
     }
 
@@ -5463,5 +5841,54 @@ mod tests {
             stderr: String::new(),
         };
         assert!(is_push_up_to_date(&output));
+    }
+
+    #[test]
+    fn read_sync_x_urls_keeps_unique_http_lines() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("bookmarks.txt");
+        fs::write(
+            &path,
+            "https://a.example\n\nnot-a-url\nhttps://b.example\nhttps://a.example\n",
+        )
+        .unwrap();
+        let urls = read_sync_x_urls(&path).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://a.example".to_string(),
+                "https://b.example".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn prepend_urls_to_read_later_sync_preserves_input_order() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("read-later.md");
+        fs::write(&path, "- https://already.example\n").unwrap();
+        let urls = vec![
+            "https://one.example".to_string(),
+            "https://two.example".to_string(),
+            "https://already.example".to_string(),
+        ];
+
+        let (added, duplicates) = prepend_urls_to_read_later_sync(&path, &urls).unwrap();
+        assert_eq!(added, 2);
+        assert_eq!(duplicates, 1);
+
+        let (_, entries) = read_entries(&path).unwrap();
+        let blocks = entries
+            .iter()
+            .map(|entry| entry.block_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            blocks,
+            vec![
+                "- https://one.example".to_string(),
+                "- https://two.example".to_string(),
+                "- https://already.example".to_string(),
+            ]
+        );
     }
 }
