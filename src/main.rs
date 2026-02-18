@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, MessageId};
-use tokio::sync::Mutex;
 use tempfile::{NamedTempFile, TempDir, TempPath};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const ACK_TTL_SECS: u64 = 5;
@@ -303,8 +303,14 @@ struct ListSession {
 #[derive(Clone, Debug)]
 enum ListView {
     Menu,
-    Peek { mode: ListMode, page: usize },
-    Selected { return_to: Box<ListView>, index: usize },
+    Peek {
+        mode: ListMode,
+        page: usize,
+    },
+    Selected {
+        return_to: Box<ListView>,
+        index: usize,
+    },
     FinishConfirm {
         selected: Box<ListView>,
         index: usize,
@@ -413,11 +419,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_message(
-    bot: Bot,
-    msg: Message,
-    state: std::sync::Arc<AppState>,
-) -> Result<()> {
+async fn handle_message(bot: Bot, msg: Message, state: std::sync::Arc<AppState>) -> Result<()> {
     let user_id = match msg.from() {
         Some(user) => user.id.0,
         None => return Ok(()),
@@ -484,8 +486,7 @@ async fn handle_message(
     }
 
     if let Some(prompt) = pending_resource_prompt {
-        handle_resource_filename_response(&bot, msg.chat.id, msg.id, &state, &text, prompt)
-            .await?;
+        handle_resource_filename_response(&bot, msg.chat.id, msg.id, &state, &text, prompt).await?;
         return Ok(());
     }
 
@@ -654,7 +655,14 @@ async fn handle_media_message(
             let dest_path = media_dir.join(&filename);
             download_telegram_file(bot, &photo.file.id, &dest_path).await?;
             let entry_text = build_media_entry_text(&filename, caption.as_deref());
-            handle_single_item(bot.clone(), chat_id, state.clone(), &entry_text, Some(msg.id)).await?;
+            handle_single_item(
+                bot.clone(),
+                chat_id,
+                state.clone(),
+                &entry_text,
+                Some(msg.id),
+            )
+            .await?;
             return Ok(true);
         }
     }
@@ -672,7 +680,14 @@ async fn handle_media_message(
         let dest_path = media_dir.join(&filename);
         download_telegram_file(bot, &document.file.id, &dest_path).await?;
         let entry_text = build_media_entry_text(&filename, caption.as_deref());
-        handle_single_item(bot.clone(), chat_id, state.clone(), &entry_text, Some(msg.id)).await?;
+        handle_single_item(
+            bot.clone(),
+            chat_id,
+            state.clone(),
+            &entry_text,
+            Some(msg.id),
+        )
+        .await?;
         return Ok(true);
     }
 
@@ -692,7 +707,14 @@ async fn handle_media_message(
         let dest_path = media_dir.join(&filename);
         download_telegram_file(bot, &video.file.id, &dest_path).await?;
         let entry_text = build_media_entry_text(&filename, caption.as_deref());
-        handle_single_item(bot.clone(), chat_id, state.clone(), &entry_text, Some(msg.id)).await?;
+        handle_single_item(
+            bot.clone(),
+            chat_id,
+            state.clone(),
+            &entry_text,
+            Some(msg.id),
+        )
+        .await?;
         return Ok(true);
     }
 
@@ -728,7 +750,8 @@ async fn handle_norm_message(
     let target_index = match norm_target_index(&session, &peeked_snapshot) {
         Some(index) => index,
         None => {
-            state.sessions
+            state
+                .sessions
                 .lock()
                 .await
                 .insert(session.id.clone(), session);
@@ -741,7 +764,8 @@ async fn handle_norm_message(
     let entry = match session.entries.get(target_index).cloned() {
         Some(entry) => entry,
         None => {
-            state.sessions
+            state
+                .sessions
                 .lock()
                 .await
                 .insert(session.id.clone(), session);
@@ -752,7 +776,8 @@ async fn handle_norm_message(
     };
 
     let Some(normalized_entry) = normalize_entry_markdown_links(&entry) else {
-        state.sessions
+        state
+            .sessions
             .lock()
             .await
             .insert(session.id.clone(), session);
@@ -797,7 +822,8 @@ async fn handle_norm_message(
         }
     }
 
-    state.sessions
+    state
+        .sessions
         .lock()
         .await
         .insert(session.id.clone(), session);
@@ -834,7 +860,8 @@ async fn handle_instant_delete_message(
     let target_index = match norm_target_index(&session, &peeked_snapshot) {
         Some(index) => index,
         None => {
-            state.sessions
+            state
+                .sessions
                 .lock()
                 .await
                 .insert(session.id.clone(), session);
@@ -847,7 +874,8 @@ async fn handle_instant_delete_message(
     let entry_block = match session.entries.get(target_index).map(|e| e.block_string()) {
         Some(entry) => entry,
         None => {
-            state.sessions
+            state
+                .sessions
                 .lock()
                 .await
                 .insert(session.id.clone(), session);
@@ -898,7 +926,8 @@ async fn handle_instant_delete_message(
         }
     }
 
-    state.sessions
+    state
+        .sessions
         .lock()
         .await
         .insert(session.id.clone(), session);
@@ -966,10 +995,7 @@ async fn handle_list_command(
     };
 
     let (text, kb) = build_menu_view(&session_id, &session);
-    let sent = bot
-        .send_message(msg.chat.id, text)
-        .reply_markup(kb)
-        .await?;
+    let sent = bot.send_message(msg.chat.id, text).reply_markup(kb).await?;
     session.message_id = Some(sent.id);
     state
         .sessions
@@ -1017,10 +1043,7 @@ async fn handle_search_command(
 
     let peeked_snapshot = state.peeked.lock().await.clone();
     let (text, kb) = render_list_view(&session_id, &session, &peeked_snapshot, &state.config);
-    let sent = bot
-        .send_message(msg.chat.id, text)
-        .reply_markup(kb)
-        .await?;
+    let sent = bot.send_message(msg.chat.id, text).reply_markup(kb).await?;
     session.message_id = Some(sent.id);
     state
         .sessions
@@ -1216,7 +1239,8 @@ async fn handle_sync_x_command(
         return Ok(());
     }
 
-    let prompt_text = "Paste the Cloudflare cookie header string from x.com (must include auth_token and ct0).";
+    let prompt_text =
+        "Paste the Cloudflare cookie header string from x.com (must include auth_token and ct0).";
     let sent = bot.send_message(msg.chat.id, prompt_text).await?;
     state.sync_x_cookie_prompts.lock().await.insert(
         msg.chat.id.0,
@@ -1238,7 +1262,12 @@ async fn handle_sync_x_cookie_response(
 ) -> Result<()> {
     let cookie_header = text.trim();
     if cookie_header.is_empty() {
-        send_error(bot, chat_id, "Cookie header is empty. Paste the full header string.").await?;
+        send_error(
+            bot,
+            chat_id,
+            "Cookie header is empty. Paste the full header string.",
+        )
+        .await?;
         state.sync_x_cookie_prompts.lock().await.insert(
             chat_id.0,
             SyncXCookiePrompt {
@@ -1268,7 +1297,9 @@ async fn handle_sync_x_cookie_response(
             } else {
                 let text = format!(
                     "X sync complete: extracted {}, added {}, skipped {} duplicates.",
-                    sync_outcome.extracted_count, sync_outcome.added_count, sync_outcome.duplicate_count
+                    sync_outcome.extracted_count,
+                    sync_outcome.added_count,
+                    sync_outcome.duplicate_count
                 );
                 bot.send_message(chat_id, text).await?;
             }
@@ -1307,11 +1338,7 @@ async fn handle_undos_command(
         message_id: sent.id,
         records,
     };
-    state
-        .undo_sessions
-        .lock()
-        .await
-        .insert(session_id, session);
+    state.undo_sessions.lock().await.insert(session_id, session);
     Ok(())
 }
 
@@ -1371,7 +1398,10 @@ async fn handle_multi_item(
     let selected = vec![false; items.len()];
     let view_text = build_picker_text(&items, &selected);
     let kb = build_picker_keyboard(&picker_id, &selected);
-    let sent = bot.send_message(chat_id, view_text).reply_markup(kb).await?;
+    let sent = bot
+        .send_message(chat_id, view_text)
+        .reply_markup(kb)
+        .await?;
 
     let picker = PickerState {
         id: picker_id.clone(),
@@ -1394,7 +1424,10 @@ async fn handle_add_command(
     let prompt_id = short_id();
     let kb = build_add_prompt_keyboard(&prompt_id);
     let prompt_text = "Add to reading list or resources?";
-    let sent = bot.send_message(msg.chat.id, prompt_text).reply_markup(kb).await?;
+    let sent = bot
+        .send_message(msg.chat.id, prompt_text)
+        .reply_markup(kb)
+        .await?;
 
     let prompt = AddPrompt {
         chat_id: msg.chat.id.0,
@@ -1495,7 +1528,10 @@ async fn start_resource_picker(
     } else {
         "Choose a resource file:"
     };
-    let sent = bot.send_message(chat_id, prompt_text).reply_markup(kb).await?;
+    let sent = bot
+        .send_message(chat_id, prompt_text)
+        .reply_markup(kb)
+        .await?;
 
     let picker = ResourcePickerState {
         chat_id: chat_id.0,
@@ -1689,9 +1725,7 @@ async fn handle_resource_filename_response(
     )
     .await?;
 
-    let _ = bot
-        .delete_message(chat_id, prompt.prompt_message_id)
-        .await;
+    let _ = bot.delete_message(chat_id, prompt.prompt_message_id).await;
     let _ = bot.delete_message(chat_id, message_id).await;
     Ok(())
 }
@@ -1783,8 +1817,7 @@ async fn handle_download_callback(
                                     DownloadAction::Send,
                                     &options,
                                 );
-                                let kb =
-                                    build_download_quality_keyboard(&picker_id, &options);
+                                let kb = build_download_quality_keyboard(&picker_id, &options);
                                 bot.edit_message_text(message.chat.id, message.id, text)
                                     .reply_markup(kb)
                                     .await?;
@@ -1828,8 +1861,7 @@ async fn handle_download_callback(
                                     DownloadAction::Save,
                                     &options,
                                 );
-                                let kb =
-                                    build_download_quality_keyboard(&picker_id, &options);
+                                let kb = build_download_quality_keyboard(&picker_id, &options);
                                 bot.edit_message_text(message.chat.id, message.id, text)
                                     .reply_markup(kb)
                                     .await?;
@@ -1864,9 +1896,10 @@ async fn handle_download_callback(
                 },
             ) = (selected, &picker.mode)
             {
-                if let (Some(link), Some(option)) =
-                    (picker.links.get(*link_index).cloned(), options.get(selected).cloned())
-                {
+                if let (Some(link), Some(option)) = (
+                    picker.links.get(*link_index).cloned(),
+                    options.get(selected).cloned(),
+                ) {
                     match action {
                         DownloadAction::Send => {
                             match download_and_send_link(
@@ -1887,20 +1920,13 @@ async fn handle_download_callback(
                             }
                         }
                         DownloadAction::Save => {
-                            match download_and_save_link(
-                                &state,
-                                &link,
-                                &option.format_selector,
-                            )
-                            .await
+                            match download_and_save_link(&state, &link, &option.format_selector)
+                                .await
                             {
                                 Ok(path) => {
                                     let note = format!("Saved to {}", path.display());
                                     let kb = InlineKeyboardMarkup::new(vec![vec![
-                                        InlineKeyboardButton::callback(
-                                            "Delete message",
-                                            "msgdel",
-                                        ),
+                                        InlineKeyboardButton::callback("Delete message", "msgdel"),
                                     ]]);
                                     bot.send_message(message.chat.id, note)
                                         .reply_markup(kb)
@@ -2007,9 +2033,7 @@ async fn handle_download_link_response(
         }
     }
     start_download_picker(bot, chat_id, state, links).await?;
-    let _ = bot
-        .delete_message(chat_id, prompt.prompt_message_id)
-        .await;
+    let _ = bot.delete_message(chat_id, prompt.prompt_message_id).await;
     let _ = bot.delete_message(chat_id, message_id).await;
     Ok(())
 }
@@ -2051,18 +2075,14 @@ async fn handle_finish_title_response(
         let session = match sessions.remove(&prompt.session_id) {
             Some(session) => session,
             None => {
-                let _ = bot
-                    .delete_message(chat_id, prompt.prompt_message_id)
-                    .await;
+                let _ = bot.delete_message(chat_id, prompt.prompt_message_id).await;
                 let _ = bot.delete_message(chat_id, message_id).await;
                 return Ok(());
             }
         };
         if session.chat_id != prompt.chat_id {
             sessions.insert(prompt.session_id.clone(), session);
-            let _ = bot
-                .delete_message(chat_id, prompt.prompt_message_id)
-                .await;
+            let _ = bot.delete_message(chat_id, prompt.prompt_message_id).await;
             let _ = bot.delete_message(chat_id, message_id).await;
             return Ok(());
         }
@@ -2080,9 +2100,7 @@ async fn handle_finish_title_response(
             .await
             .insert(prompt.session_id.clone(), session);
         send_error(bot, chat_id, "Item not found.").await?;
-        let _ = bot
-            .delete_message(chat_id, prompt.prompt_message_id)
-            .await;
+        let _ = bot.delete_message(chat_id, prompt.prompt_message_id).await;
         let _ = bot.delete_message(chat_id, message_id).await;
         return Ok(());
     };
@@ -2138,9 +2156,7 @@ async fn handle_finish_title_response(
         .await
         .insert(chat_id.0, prompt.session_id.clone());
 
-    let _ = bot
-        .delete_message(chat_id, prompt.prompt_message_id)
-        .await;
+    let _ = bot.delete_message(chat_id, prompt.prompt_message_id).await;
     let _ = bot.delete_message(chat_id, message_id).await;
     Ok(())
 }
@@ -2186,284 +2202,150 @@ async fn handle_list_callback(
     };
 
     let peeked_snapshot = state.peeked.lock().await.clone();
+    let mut refresh_list_view = true;
+    let mut close_session = false;
 
-    match action {
-        "menu" => {
-            if matches!(&session.kind, SessionKind::List) {
-                session.view = ListView::Menu;
+    let action_result: Result<()> = async {
+        match action {
+            "menu" => {
+                if matches!(&session.kind, SessionKind::List) {
+                    session.view = ListView::Menu;
+                }
             }
-        }
-        "top" => {
-            let page = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-            session.view = ListView::Peek {
-                mode: ListMode::Top,
-                page,
-            };
-        }
-        "bottom" => {
-            let page = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-            session.view = ListView::Peek {
-                mode: ListMode::Bottom,
-                page,
-            };
-        }
-        "next" => {
-            if let ListView::Peek { mode, page } = session.view.clone() {
+            "top" => {
+                let page = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
                 session.view = ListView::Peek {
-                    mode,
-                    page: page + 1,
+                    mode: ListMode::Top,
+                    page,
                 };
             }
-        }
-        "prev" => {
-            if let ListView::Peek { mode, page } = session.view.clone() {
+            "bottom" => {
+                let page = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
                 session.view = ListView::Peek {
-                    mode,
-                    page: page.saturating_sub(1),
+                    mode: ListMode::Bottom,
+                    page,
                 };
             }
-        }
-        "back" => {
-            session.view = match session.view.clone() {
-                ListView::Selected { return_to, .. } => *return_to,
-                ListView::Peek { .. } => ListView::Menu,
-                other => other,
-            };
-        }
-        "close" => {
-            if matches!(&session.kind, SessionKind::Search { .. }) {
-                delete_embedded_media_messages(&bot, message.chat.id, &session.sent_media_message_ids)
+            "next" => {
+                if let ListView::Peek { mode, page } = session.view.clone() {
+                    session.view = ListView::Peek {
+                        mode,
+                        page: page + 1,
+                    };
+                }
+            }
+            "prev" => {
+                if let ListView::Peek { mode, page } = session.view.clone() {
+                    session.view = ListView::Peek {
+                        mode,
+                        page: page.saturating_sub(1),
+                    };
+                }
+            }
+            "back" => {
+                session.view = match session.view.clone() {
+                    ListView::Selected { return_to, .. } => *return_to,
+                    ListView::Peek { .. } => ListView::Menu,
+                    other => other,
+                };
+            }
+            "close" => {
+                if matches!(&session.kind, SessionKind::Search { .. }) {
+                    delete_embedded_media_messages(
+                        &bot,
+                        message.chat.id,
+                        &session.sent_media_message_ids,
+                    )
                     .await;
-                bot.delete_message(message.chat.id, message.id).await?;
-                let mut active = state.active_sessions.lock().await;
-                if active.get(&chat_id) == Some(&session.id) {
-                    active.remove(&chat_id);
+                    bot.delete_message(message.chat.id, message.id).await?;
+                    let mut active = state.active_sessions.lock().await;
+                    if active.get(&chat_id) == Some(&session.id) {
+                        active.remove(&chat_id);
+                    }
+                    close_session = true;
+                    refresh_list_view = false;
                 }
-                bot.answer_callback_query(q.id).await?;
-                return Ok(());
             }
-        }
-        "random" => {
-            if matches!(&session.kind, SessionKind::List) {
-                if session.entries.is_empty() {
-                    // Stay in place.
-                } else {
-                    let mut remaining: Vec<usize> = (0..session.entries.len())
-                        .filter(|i| !session.seen_random.contains(i))
-                        .filter(|i| {
-                            session
-                                .entries
-                                .get(*i)
-                                .map(|entry| !peeked_snapshot.contains(&entry.block_string()))
-                                .unwrap_or(false)
-                        })
-                        .collect();
-                    if remaining.is_empty() {
-                        send_ephemeral(
-                            &bot,
-                            message.chat.id,
-                            "Everything's been peeked already.",
-                            ACK_TTL_SECS,
-                        )
-                        .await?;
+            "random" => {
+                if matches!(&session.kind, SessionKind::List) {
+                    if session.entries.is_empty() {
                         // Stay in place.
-                        session.view = ListView::Menu;
                     } else {
-                        let index = {
-                            let mut rng = rand::thread_rng();
-                            remaining.shuffle(&mut rng);
-                            remaining.first().copied()
-                        };
-                        if let Some(index) = index {
-                            session.seen_random.insert(index);
-                            let return_to = Box::new(session.view.clone());
-                            session.view = ListView::Selected { return_to, index };
-                            if let Some(entry) = session.entries.get(index) {
-                                state.peeked.lock().await.insert(entry.block_string());
+                        let mut remaining: Vec<usize> = (0..session.entries.len())
+                            .filter(|i| !session.seen_random.contains(i))
+                            .filter(|i| {
+                                session
+                                    .entries
+                                    .get(*i)
+                                    .map(|entry| !peeked_snapshot.contains(&entry.block_string()))
+                                    .unwrap_or(false)
+                            })
+                            .collect();
+                        if remaining.is_empty() {
+                            send_ephemeral(
+                                &bot,
+                                message.chat.id,
+                                "Everything's been peeked already.",
+                                ACK_TTL_SECS,
+                            )
+                            .await?;
+                            // Stay in place.
+                            session.view = ListView::Menu;
+                        } else {
+                            let index = {
+                                let mut rng = rand::thread_rng();
+                                remaining.shuffle(&mut rng);
+                                remaining.first().copied()
+                            };
+                            if let Some(index) = index {
+                                session.seen_random.insert(index);
+                                let return_to = Box::new(session.view.clone());
+                                session.view = ListView::Selected { return_to, index };
+                                if let Some(entry) = session.entries.get(index) {
+                                    state.peeked.lock().await.insert(entry.block_string());
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-        "pick" => {
-            if let ListView::Peek { mode, page } = session.view.clone() {
-                let pick_index = parts.next().and_then(|p| p.parse::<usize>().ok());
-                if let Some(pick_index) = pick_index {
-                    if let Some(entry_index) =
-                        peek_indices_for_session(&session, &peeked_snapshot, mode, page)
-                            .get(pick_index.saturating_sub(1))
-                            .copied()
-                    {
-                        let return_to = Box::new(ListView::Peek { mode, page });
-                        session.view = ListView::Selected {
-                            return_to,
-                            index: entry_index,
-                        };
-                        if matches!(&session.kind, SessionKind::List) {
-                            if let Some(entry) = session.entries.get(entry_index) {
-                                state.peeked.lock().await.insert(entry.block_string());
+            "pick" => {
+                if let ListView::Peek { mode, page } = session.view.clone() {
+                    let pick_index = parts.next().and_then(|p| p.parse::<usize>().ok());
+                    if let Some(pick_index) = pick_index {
+                        if let Some(entry_index) =
+                            peek_indices_for_session(&session, &peeked_snapshot, mode, page)
+                                .get(pick_index.saturating_sub(1))
+                                .copied()
+                        {
+                            let return_to = Box::new(ListView::Peek { mode, page });
+                            session.view = ListView::Selected {
+                                return_to,
+                                index: entry_index,
+                            };
+                            if matches!(&session.kind, SessionKind::List) {
+                                if let Some(entry) = session.entries.get(entry_index) {
+                                    state.peeked.lock().await.insert(entry.block_string());
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-        "finish" => {
-            if let ListView::Selected { index, .. } = session.view.clone() {
-                session.view = ListView::FinishConfirm {
-                    selected: Box::new(session.view.clone()),
-                    index,
-                };
-            }
-        }
-        "finish_now" => {
-            if let ListView::FinishConfirm { selected, index } = session.view.clone() {
-                let entry_block = session.entries.get(index).map(|e| e.block_string());
-                if let Some(entry_block) = entry_block {
-                    let op = QueuedOp {
-                        kind: QueuedOpKind::MoveToFinished,
-                        entry: entry_block.clone(),
-                        resource_path: None,
-                        updated_entry: None,
-                    };
-                    match apply_user_op(&state, &op).await? {
-                        UserOpOutcome::Applied(ApplyOutcome::Applied) => {
-                            session.entries.remove(index);
-                            if let ListView::Selected { return_to, .. } = *selected {
-                                session.view = *return_to;
-                            } else {
-                                session.view = ListView::Menu;
-                            }
-                            normalize_peek_view(&mut session, &peeked_snapshot);
-                            send_ephemeral(&bot, message.chat.id, "Moved.", ACK_TTL_SECS)
-                                .await?;
-                            let _ = add_undo(&state, UndoKind::MoveToFinished, entry_block).await?;
-                        }
-                        UserOpOutcome::Applied(ApplyOutcome::NotFound) => {
-                            send_error(&bot, message.chat.id, "Item not found.").await?;
-                            session.view = *selected;
-                        }
-                        UserOpOutcome::Applied(ApplyOutcome::Duplicate) => {
-                            session.view = *selected;
-                        }
-                        UserOpOutcome::Queued => {
-                            send_error(&bot, message.chat.id, "Write failed; queued for retry.")
-                                .await?;
-                            session.view = *selected;
-                        }
-                    }
-                }
-            }
-        }
-        "finish_title" => {
-            if let ListView::FinishConfirm { selected, index } = session.view.clone() {
-                let selected_view = *selected;
-                if let Some(entry) = session.entries.get(index) {
-                    let text = entry.display_lines().join("\n");
-                    let links = extract_links(&text);
-                    if let Some(link) = links.first().cloned() {
-                        let prompt_text = "Send a title for the finished item.";
-                        let sent = bot.send_message(message.chat.id, prompt_text).await?;
-                        let return_to = match selected_view.clone() {
-                            ListView::Selected { return_to, .. } => *return_to,
-                            _ => ListView::Menu,
-                        };
-                        let prompt = FinishTitlePrompt {
-                            session_id: session.id.clone(),
-                            chat_id,
-                            entry: entry.block_string(),
-                            link,
-                            return_to,
-                            prompt_message_id: sent.id,
-                            expires_at: now_ts() + FINISH_TITLE_PROMPT_TTL_SECS,
-                        };
-                        let previous = state
-                            .finish_title_prompts
-                            .lock()
-                            .await
-                            .insert(chat_id, prompt);
-                        if let Some(previous) = previous {
-                            let _ = bot
-                                .delete_message(message.chat.id, previous.prompt_message_id)
-                                .await;
-                        }
-                        session.view = selected_view;
-                    } else {
-                        send_error(&bot, message.chat.id, "No link found for a title.").await?;
-                        session.view = selected_view;
-                    }
-                } else {
-                    send_error(&bot, message.chat.id, "Item not found.").await?;
-                    session.view = selected_view;
-                }
-            }
-        }
-        "finish_cancel" => {
-            if let ListView::FinishConfirm { selected, .. } = session.view.clone() {
-                session.view = *selected;
-            }
-        }
-        "resource" => {
-            if let ListView::Selected { index, .. } = session.view.clone() {
-                if let Some(entry) = session.entries.get(index) {
-                    let text = entry.display_lines().join("\n");
-                    start_resource_picker(&bot, message.chat.id, &state, &text, None).await?;
-                } else {
-                    send_error(&bot, message.chat.id, "Item not found.").await?;
-                }
-            }
-        }
-        "delete" => {
-            if let ListView::Selected { index, .. } = session.view.clone() {
-                let expires_at = now_ts() + DELETE_CONFIRM_TTL_SECS;
-                session.view = ListView::DeleteConfirm {
-                    selected: Box::new(session.view.clone()),
-                    index,
-                    step: 1,
-                    expires_at,
-                };
-            }
-        }
-        "del1" => {
-            if let ListView::DeleteConfirm {
-                selected,
-                index,
-                step: _,
-                expires_at,
-            } = session.view.clone()
-            {
-                if now_ts() > expires_at {
-                    session.view = *selected;
-                    send_error(&bot, message.chat.id, "Delete confirmation expired.")
-                        .await?;
-                } else {
-                    session.view = ListView::DeleteConfirm {
-                        selected,
+            "finish" => {
+                if let ListView::Selected { index, .. } = session.view.clone() {
+                    session.view = ListView::FinishConfirm {
+                        selected: Box::new(session.view.clone()),
                         index,
-                        step: 2,
-                        expires_at,
                     };
                 }
             }
-        }
-        "del2" => {
-            if let ListView::DeleteConfirm {
-                selected,
-                index,
-                step: _,
-                expires_at,
-            } = session.view.clone()
-            {
-                if now_ts() > expires_at {
-                    session.view = *selected;
-                    send_error(&bot, message.chat.id, "Delete confirmation expired.")
-                        .await?;
-                } else {
+            "finish_now" => {
+                if let ListView::FinishConfirm { selected, index } = session.view.clone() {
                     let entry_block = session.entries.get(index).map(|e| e.block_string());
                     if let Some(entry_block) = entry_block {
                         let op = QueuedOp {
-                            kind: QueuedOpKind::Delete,
+                            kind: QueuedOpKind::MoveToFinished,
                             entry: entry_block.clone(),
                             resource_path: None,
                             updated_entry: None,
@@ -2477,13 +2359,18 @@ async fn handle_list_callback(
                                     session.view = ListView::Menu;
                                 }
                                 normalize_peek_view(&mut session, &peeked_snapshot);
-                                let _ = add_undo(&state, UndoKind::Delete, entry_block).await?;
+                                send_ephemeral(&bot, message.chat.id, "Moved.", ACK_TTL_SECS)
+                                    .await?;
+                                let _ =
+                                    add_undo(&state, UndoKind::MoveToFinished, entry_block).await?;
                             }
                             UserOpOutcome::Applied(ApplyOutcome::NotFound) => {
                                 send_error(&bot, message.chat.id, "Item not found.").await?;
                                 session.view = *selected;
                             }
-                            UserOpOutcome::Applied(ApplyOutcome::Duplicate) => {}
+                            UserOpOutcome::Applied(ApplyOutcome::Duplicate) => {
+                                session.view = *selected;
+                            }
                             UserOpOutcome::Queued => {
                                 send_error(
                                     &bot,
@@ -2497,38 +2384,236 @@ async fn handle_list_callback(
                     }
                 }
             }
+            "finish_title" => {
+                if let ListView::FinishConfirm { selected, index } = session.view.clone() {
+                    let selected_view = *selected;
+                    if let Some(entry) = session.entries.get(index) {
+                        let text = entry.display_lines().join("\n");
+                        let links = extract_links(&text);
+                        if let Some(link) = links.first().cloned() {
+                            let prompt_text = "Send a title for the finished item.";
+                            let sent = bot.send_message(message.chat.id, prompt_text).await?;
+                            let return_to = match selected_view.clone() {
+                                ListView::Selected { return_to, .. } => *return_to,
+                                _ => ListView::Menu,
+                            };
+                            let prompt = FinishTitlePrompt {
+                                session_id: session.id.clone(),
+                                chat_id,
+                                entry: entry.block_string(),
+                                link,
+                                return_to,
+                                prompt_message_id: sent.id,
+                                expires_at: now_ts() + FINISH_TITLE_PROMPT_TTL_SECS,
+                            };
+                            let previous = state
+                                .finish_title_prompts
+                                .lock()
+                                .await
+                                .insert(chat_id, prompt);
+                            if let Some(previous) = previous {
+                                let _ = bot
+                                    .delete_message(message.chat.id, previous.prompt_message_id)
+                                    .await;
+                            }
+                            session.view = selected_view;
+                        } else {
+                            send_error(&bot, message.chat.id, "No link found for a title.").await?;
+                            session.view = selected_view;
+                        }
+                    } else {
+                        send_error(&bot, message.chat.id, "Item not found.").await?;
+                        session.view = selected_view;
+                    }
+                }
+            }
+            "finish_cancel" => {
+                if let ListView::FinishConfirm { selected, .. } = session.view.clone() {
+                    session.view = *selected;
+                }
+            }
+            "resource" => {
+                if let ListView::Selected { index, .. } = session.view.clone() {
+                    if let Some(entry) = session.entries.get(index) {
+                        let text = entry.display_lines().join("\n");
+                        start_resource_picker(&bot, message.chat.id, &state, &text, None).await?;
+                        refresh_list_view = false;
+                    } else {
+                        send_error(&bot, message.chat.id, "Item not found.").await?;
+                    }
+                }
+            }
+            "delete" => {
+                if let ListView::Selected { index, .. } = session.view.clone() {
+                    let expires_at = now_ts() + DELETE_CONFIRM_TTL_SECS;
+                    session.view = ListView::DeleteConfirm {
+                        selected: Box::new(session.view.clone()),
+                        index,
+                        step: 1,
+                        expires_at,
+                    };
+                }
+            }
+            "del1" => {
+                if let ListView::DeleteConfirm {
+                    selected,
+                    index,
+                    step: _,
+                    expires_at,
+                } = session.view.clone()
+                {
+                    if now_ts() > expires_at {
+                        session.view = *selected;
+                        send_error(&bot, message.chat.id, "Delete confirmation expired.").await?;
+                    } else {
+                        session.view = ListView::DeleteConfirm {
+                            selected,
+                            index,
+                            step: 2,
+                            expires_at,
+                        };
+                    }
+                }
+            }
+            "del2" => {
+                if let ListView::DeleteConfirm {
+                    selected,
+                    index,
+                    step: _,
+                    expires_at,
+                } = session.view.clone()
+                {
+                    if now_ts() > expires_at {
+                        session.view = *selected;
+                        send_error(&bot, message.chat.id, "Delete confirmation expired.").await?;
+                    } else {
+                        let entry_block = session.entries.get(index).map(|e| e.block_string());
+                        if let Some(entry_block) = entry_block {
+                            let op = QueuedOp {
+                                kind: QueuedOpKind::Delete,
+                                entry: entry_block.clone(),
+                                resource_path: None,
+                                updated_entry: None,
+                            };
+                            match apply_user_op(&state, &op).await? {
+                                UserOpOutcome::Applied(ApplyOutcome::Applied) => {
+                                    session.entries.remove(index);
+                                    if let ListView::Selected { return_to, .. } = *selected {
+                                        session.view = *return_to;
+                                    } else {
+                                        session.view = ListView::Menu;
+                                    }
+                                    normalize_peek_view(&mut session, &peeked_snapshot);
+                                    let _ = add_undo(&state, UndoKind::Delete, entry_block).await?;
+                                }
+                                UserOpOutcome::Applied(ApplyOutcome::NotFound) => {
+                                    send_error(&bot, message.chat.id, "Item not found.").await?;
+                                    session.view = *selected;
+                                }
+                                UserOpOutcome::Applied(ApplyOutcome::Duplicate) => {}
+                                UserOpOutcome::Queued => {
+                                    send_error(
+                                        &bot,
+                                        message.chat.id,
+                                        "Write failed; queued for retry.",
+                                    )
+                                    .await?;
+                                    session.view = *selected;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "cancel_del" => {
+                if let ListView::DeleteConfirm { selected, .. } = session.view.clone() {
+                    session.view = *selected;
+                }
+            }
+            _ => {}
         }
-        "cancel_del" => {
-            if let ListView::DeleteConfirm { selected, .. } = session.view.clone() {
-                session.view = *selected;
+
+        if close_session {
+            return Ok(());
+        }
+
+        if refresh_list_view {
+            session.message_id = Some(message.id);
+            let (text, kb) =
+                render_list_view(&session.id, &session, &peeked_snapshot, &state.config);
+            match bot
+                .edit_message_text(message.chat.id, message.id, text)
+                .reply_markup(kb)
+                .await
+            {
+                Ok(_) => {}
+                Err(err) if is_message_not_modified_error(&err) => {}
+                Err(err) => {
+                    error!(
+                        "list view edit failed; sending replacement message instead: {:#}",
+                        err
+                    );
+                    let (fallback_text, fallback_kb) =
+                        render_list_view(&session.id, &session, &peeked_snapshot, &state.config);
+                    let sent = bot
+                        .send_message(message.chat.id, fallback_text)
+                        .reply_markup(fallback_kb)
+                        .await?;
+                    session.message_id = Some(sent.id);
+                }
+            }
+            if let Err(err) = refresh_embedded_media_for_view(
+                &bot,
+                message.chat.id,
+                &state,
+                &mut session,
+                &peeked_snapshot,
+            )
+            .await
+            {
+                error!("send embedded media failed: {:#}", err);
             }
         }
-        _ => {}
+
+        Ok(())
+    }
+    .await;
+
+    if !close_session {
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session.id.clone(), session.clone());
+        state
+            .active_sessions
+            .lock()
+            .await
+            .insert(chat_id, session.id.clone());
     }
 
-    session.message_id = Some(message.id);
-    let (text, kb) = render_list_view(&session.id, &session, &peeked_snapshot, &state.config);
-    bot.edit_message_text(message.chat.id, message.id, text)
-        .reply_markup(kb)
-        .await?;
-    if let Err(err) =
-        refresh_embedded_media_for_view(&bot, message.chat.id, &state, &mut session, &peeked_snapshot)
-            .await
-    {
-        error!("send embedded media failed: {:#}", err);
+    let answer_result = bot.answer_callback_query(q.id).await;
+    match action_result {
+        Ok(()) => {
+            answer_result?;
+            Ok(())
+        }
+        Err(err) => {
+            if let Err(answer_err) = answer_result {
+                error!(
+                    "answer callback query failed after list callback error: {:#}",
+                    answer_err
+                );
+            }
+            Err(err)
+        }
     }
-    state
-        .sessions
-        .lock()
-        .await
-        .insert(session.id.clone(), session.clone());
-    state
-        .active_sessions
-        .lock()
-        .await
-        .insert(chat_id, session.id.clone());
-    bot.answer_callback_query(q.id).await?;
-    Ok(())
+}
+
+fn is_message_not_modified_error(err: &teloxide::RequestError) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("message is not modified")
 }
 
 async fn handle_picker_callback(
@@ -2620,12 +2705,14 @@ async fn handle_picker_callback(
             }
 
             if queued {
-                send_error(&bot, message.chat.id, "Write failed; queued for retry.")
-                    .await?;
+                send_error(&bot, message.chat.id, "Write failed; queued for retry.").await?;
             }
 
             let summary = if duplicates > 0 {
-                format!("Saved {} item(s); {} duplicate(s) skipped.", added, duplicates)
+                format!(
+                    "Saved {} item(s); {} duplicate(s) skipped.",
+                    added, duplicates
+                )
             } else {
                 format!("Saved {} item(s).", added)
             };
@@ -2734,8 +2821,7 @@ async fn handle_undos_callback(
                     send_ephemeral(&bot, message.chat.id, "Undone.", ACK_TTL_SECS).await?;
                 }
                 UserOpOutcome::Queued => {
-                    send_error(&bot, message.chat.id, "Write failed; queued for retry.")
-                        .await?;
+                    send_error(&bot, message.chat.id, "Write failed; queued for retry.").await?;
                 }
             }
         }
@@ -2858,8 +2944,8 @@ async fn apply_op(state: &std::sync::Arc<AppState>, op: &QueuedOp) -> Result<App
     match op.kind {
         QueuedOpKind::Add => {
             let entry = EntryBlock::from_block(&op.entry);
-            let outcome = with_retries(|| add_entry_sync(&state.config.read_later_path, &entry))
-                .await?;
+            let outcome =
+                with_retries(|| add_entry_sync(&state.config.read_later_path, &entry)).await?;
             Ok(match outcome {
                 AddOutcome::Added => ApplyOutcome::Applied,
                 AddOutcome::Duplicate => ApplyOutcome::Duplicate,
@@ -2877,10 +2963,9 @@ async fn apply_op(state: &std::sync::Arc<AppState>, op: &QueuedOp) -> Result<App
             })
         }
         QueuedOpKind::Delete => {
-            let outcome = with_retries(|| {
-                delete_entry_sync(&state.config.read_later_path, &op.entry)
-            })
-            .await?;
+            let outcome =
+                with_retries(|| delete_entry_sync(&state.config.read_later_path, &op.entry))
+                    .await?;
             Ok(match outcome {
                 ModifyOutcome::Applied => ApplyOutcome::Applied,
                 ModifyOutcome::NotFound => ApplyOutcome::NotFound,
@@ -3036,7 +3121,8 @@ fn run_push(sync: &SyncConfig) -> Result<PushOutcome> {
         ));
     }
 
-    let username = extract_https_username(&remote_url).unwrap_or_else(|| "x-access-token".to_string());
+    let username =
+        extract_https_username(&remote_url).unwrap_or_else(|| "x-access-token".to_string());
 
     let status_output = run_git(&sync.repo_path, &["status", "--porcelain"], Vec::new())?;
     if !status_output.status.success() {
@@ -3157,12 +3243,7 @@ fn run_pull(sync: &SyncConfig, mode: PullMode) -> Result<PullOutcome> {
     ];
 
     let pull_args: Vec<String> = match mode {
-        PullMode::FastForward => vec![
-            "pull".to_string(),
-            "--ff-only".to_string(),
-            remote,
-            branch,
-        ],
+        PullMode::FastForward => vec!["pull".to_string(), "--ff-only".to_string(), remote, branch],
         PullMode::Theirs => vec![
             "pull".to_string(),
             "--no-edit".to_string(),
@@ -3339,7 +3420,8 @@ fn run_sync_x(config: &Config, cookie_header: &str) -> Result<SyncXOutcome> {
     } else {
         Vec::new()
     };
-    let (added_count, duplicate_count) = prepend_urls_to_read_later_sync(&config.read_later_path, &urls)?;
+    let (added_count, duplicate_count) =
+        prepend_urls_to_read_later_sync(&config.read_later_path, &urls)?;
 
     let _ = fs::remove_file(&bookmarks_path);
     let _ = fs::remove_file(&creds_path);
@@ -3472,8 +3554,8 @@ fn trim_tail(text: &str, max_chars: usize) -> String {
 }
 
 fn read_sync_x_urls(path: &Path) -> Result<Vec<String>> {
-    let contents =
-        fs::read_to_string(path).with_context(|| format!("read bookmarks file {}", path.display()))?;
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("read bookmarks file {}", path.display()))?;
     let mut seen = HashSet::new();
     let mut urls = Vec::new();
     for line in contents.lines() {
@@ -3595,7 +3677,11 @@ fn git_remote_url(repo_path: &Path, remote: &str) -> Result<String> {
 }
 
 fn git_current_branch(repo_path: &Path) -> Result<String> {
-    let output = run_git(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"], Vec::new())?;
+    let output = run_git(
+        repo_path,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+        Vec::new(),
+    )?;
     if !output.status.success() {
         return Err(anyhow!(format_git_error("git rev-parse", &output)));
     }
@@ -3700,8 +3786,8 @@ async fn download_and_send_link(
     let path = tokio::task::spawn_blocking(move || {
         run_ytdlp_download(&target_dir, &link, &format_selector)
     })
-        .await
-        .context("yt-dlp task failed")??;
+    .await
+    .context("yt-dlp task failed")??;
     bot.send_document(chat_id, InputFile::file(path)).await?;
     Ok(())
 }
@@ -3719,8 +3805,8 @@ async fn download_and_save_link(
     let path = tokio::task::spawn_blocking(move || {
         run_ytdlp_download(&target_dir, &link, &format_selector)
     })
-        .await
-        .context("yt-dlp task failed")??;
+    .await
+    .context("yt-dlp task failed")??;
     if !path.exists() {
         return Err(anyhow!("Download completed but file is missing."));
     }
@@ -3755,8 +3841,14 @@ fn run_ytdlp_list_formats(link: &str) -> Result<Vec<DownloadQualityOption>> {
         let Some(format_id) = format.get("format_id").and_then(|v| v.as_str()) else {
             continue;
         };
-        let vcodec = format.get("vcodec").and_then(|v| v.as_str()).unwrap_or("none");
-        let acodec = format.get("acodec").and_then(|v| v.as_str()).unwrap_or("none");
+        let vcodec = format
+            .get("vcodec")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
+        let acodec = format
+            .get("acodec")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
         let ext = format
             .get("ext")
             .and_then(|v| v.as_str())
@@ -3930,10 +4022,7 @@ fn matches_query(entry: &EntryBlock, query: &str) -> bool {
 }
 
 #[cfg(test)]
-fn displayed_indices_for_view(
-    session: &ListSession,
-    peeked: &HashSet<String>,
-) -> Vec<usize> {
+fn displayed_indices_for_view(session: &ListSession, peeked: &HashSet<String>) -> Vec<usize> {
     match session.view {
         ListView::Peek { mode, page } => peek_indices_for_session(session, peeked, mode, page),
         ListView::Selected { index, .. } => vec![index],
@@ -4083,9 +4172,7 @@ fn extract_links(text: &str) -> Vec<String> {
         };
         let start = scan + pos;
         let rest = &text[start..];
-        let end_rel = rest
-            .find(|c: char| c.is_whitespace())
-            .unwrap_or(rest.len());
+        let end_rel = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
         let end = start + end_rel;
         let mut url = text[start..end].to_string();
         url = trim_link(&url);
@@ -4158,10 +4245,7 @@ fn build_picker_keyboard(picker_id: &str, selected: &[bool]) -> InlineKeyboardMa
         rows.push(vec![InlineKeyboardButton::callback(label, data)]);
     }
     rows.push(vec![
-        InlineKeyboardButton::callback(
-            "Add selected",
-            format!("pick:{}:add", picker_id),
-        ),
+        InlineKeyboardButton::callback("Add selected", format!("pick:{}:add", picker_id)),
         InlineKeyboardButton::callback("Cancel", format!("pick:{}:cancel", picker_id)),
     ]);
     InlineKeyboardMarkup::new(rows)
@@ -4170,10 +4254,7 @@ fn build_picker_keyboard(picker_id: &str, selected: &[bool]) -> InlineKeyboardMa
 fn build_add_prompt_keyboard(prompt_id: &str) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback(
-                "Reading list",
-                format!("add:{}:normal", prompt_id),
-            ),
+            InlineKeyboardButton::callback("Reading list", format!("add:{}:normal", prompt_id)),
             InlineKeyboardButton::callback("Resource", format!("add:{}:resource", prompt_id)),
         ],
         vec![InlineKeyboardButton::callback(
@@ -4183,10 +4264,7 @@ fn build_add_prompt_keyboard(prompt_id: &str) -> InlineKeyboardMarkup {
     ])
 }
 
-fn build_resource_picker_keyboard(
-    picker_id: &str,
-    files: &[PathBuf],
-) -> InlineKeyboardMarkup {
+fn build_resource_picker_keyboard(picker_id: &str, files: &[PathBuf]) -> InlineKeyboardMarkup {
     let mut rows: Vec<Vec<InlineKeyboardButton>> = Vec::new();
     let mut current_row = Vec::new();
     for (idx, path) in files.iter().enumerate() {
@@ -4244,10 +4322,7 @@ fn build_download_quality_text(
     text.trim_end().to_string()
 }
 
-fn build_download_picker_keyboard(
-    picker_id: &str,
-    links: &[String],
-) -> InlineKeyboardMarkup {
+fn build_download_picker_keyboard(picker_id: &str, links: &[String]) -> InlineKeyboardMarkup {
     let mut rows = Vec::new();
     for (idx, _) in links.iter().enumerate() {
         rows.push(vec![
@@ -4305,7 +4380,9 @@ fn render_list_view(
         ListView::Peek { mode, page } => {
             build_peek_view(session_id, session, *mode, *page, peeked, config)
         }
-        ListView::Selected { index, .. } => build_selected_view(session_id, session, *index, config),
+        ListView::Selected { index, .. } => {
+            build_selected_view(session_id, session, *index, config)
+        }
         ListView::FinishConfirm { index, .. } => {
             build_finish_confirm_view(session_id, session, *index, config)
         }
@@ -4395,7 +4472,12 @@ fn build_peek_view(
         }
         SessionKind::Search { query } => {
             if total_pages > 0 {
-                format!("Matches for \"{}\" (page {}/{})\n", query, page + 1, total_pages)
+                format!(
+                    "Matches for \"{}\" (page {}/{})\n",
+                    query,
+                    page + 1,
+                    total_pages
+                )
             } else {
                 format!("Matches for \"{}\"\n", query)
             }
@@ -4474,21 +4556,18 @@ fn build_selected_view(
     let rows = match &session.kind {
         SessionKind::List => vec![
             vec![
-                InlineKeyboardButton::callback("Mark Finished", format!("ls:{}:finish", session_id)),
+                InlineKeyboardButton::callback(
+                    "Mark Finished",
+                    format!("ls:{}:finish", session_id),
+                ),
                 InlineKeyboardButton::callback(
                     "Add Resource",
                     format!("ls:{}:resource", session_id),
                 ),
             ],
             vec![
-                InlineKeyboardButton::callback(
-                    "Delete",
-                    format!("ls:{}:delete", session_id),
-                ),
-                InlineKeyboardButton::callback(
-                    "Random",
-                    format!("ls:{}:random", session_id),
-                ),
+                InlineKeyboardButton::callback("Delete", format!("ls:{}:delete", session_id)),
+                InlineKeyboardButton::callback("Random", format!("ls:{}:random", session_id)),
             ],
             vec![InlineKeyboardButton::callback(
                 "Back",
@@ -4748,12 +4827,7 @@ fn undo_preview(entry: &str) -> Vec<String> {
     entry.preview_lines()
 }
 
-async fn send_ephemeral(
-    bot: &Bot,
-    chat_id: ChatId,
-    text: &str,
-    ttl_secs: u64,
-) -> Result<()> {
+async fn send_ephemeral(bot: &Bot, chat_id: ChatId, text: &str, ttl_secs: u64) -> Result<()> {
     let sent = bot.send_message(chat_id, text).await?;
     let bot = bot.clone();
     tokio::spawn(async move {
@@ -4807,7 +4881,8 @@ async fn refresh_embedded_media_for_view(
     peeked: &HashSet<String>,
 ) -> Result<()> {
     delete_embedded_media_messages(bot, chat_id, &session.sent_media_message_ids).await;
-    session.sent_media_message_ids = send_embedded_media_for_view(bot, chat_id, state, session, peeked).await?;
+    session.sent_media_message_ids =
+        send_embedded_media_for_view(bot, chat_id, state, session, peeked).await?;
     Ok(())
 }
 
@@ -4883,8 +4958,8 @@ fn resolve_user_id_path(path: &Path, config_dir: &Path) -> PathBuf {
 }
 
 fn read_user_id_file(path: &Path) -> Result<u64> {
-    let contents =
-        fs::read_to_string(path).with_context(|| format!("read user_id file {}", path.display()))?;
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("read user_id file {}", path.display()))?;
     parse_user_id_value(contents.trim())
         .with_context(|| format!("parse user_id from {}", path.display()))
 }
@@ -4898,7 +4973,8 @@ fn parse_user_id_value(raw: &str) -> Result<u64> {
 }
 
 fn load_config(path: &Path) -> Result<Config> {
-    let contents = fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
     let config_file: ConfigFile = toml::from_str(&contents).context("parse config")?;
     let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let user_id = resolve_user_id(config_file.user_id, config_dir)?;
@@ -4958,8 +5034,14 @@ fn list_resource_files(dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     files.sort_by(|a, b| {
-        let a_name = a.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-        let b_name = b.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        let a_name = a
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        let b_name = b
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
         a_name.cmp(&b_name)
     });
     Ok(files)
@@ -4969,8 +5051,8 @@ fn read_entries(path: &Path) -> Result<(Vec<String>, Vec<EntryBlock>)> {
     if !path.exists() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("read file {}", path.display()))?;
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("read file {}", path.display()))?;
     let normalized = normalize_line_endings(&contents);
     Ok(parse_entries(&normalized))
 }
@@ -5072,9 +5154,7 @@ fn add_resource_entry_sync(path: &Path, entry_block: &str) -> Result<AddOutcome>
 
 fn delete_entry_sync(path: &Path, entry_block: &str) -> Result<ModifyOutcome> {
     let (preamble, mut entries) = read_entries(path)?;
-    let pos = entries
-        .iter()
-        .position(|e| e.block_string() == entry_block);
+    let pos = entries.iter().position(|e| e.block_string() == entry_block);
     let Some(pos) = pos else {
         return Ok(ModifyOutcome::NotFound);
     };
@@ -5089,9 +5169,7 @@ fn update_entry_sync(
     updated_entry: &EntryBlock,
 ) -> Result<ModifyOutcome> {
     let (preamble, mut entries) = read_entries(path)?;
-    let pos = entries
-        .iter()
-        .position(|e| e.block_string() == entry_block);
+    let pos = entries.iter().position(|e| e.block_string() == entry_block);
     let Some(pos) = pos else {
         return Ok(ModifyOutcome::NotFound);
     };
@@ -5169,7 +5247,8 @@ fn load_queue(path: &Path) -> Result<Vec<QueuedOp>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let data = fs::read_to_string(path).with_context(|| format!("read queue {}", path.display()))?;
+    let data =
+        fs::read_to_string(path).with_context(|| format!("read queue {}", path.display()))?;
     let queue = serde_json::from_str(&data).context("parse queue")?;
     Ok(queue)
 }
@@ -5330,9 +5409,9 @@ fn format_embedded_references_for_lines(lines: &[String], config: &Config) -> Ve
 }
 
 fn pick_best_photo(photos: &[teloxide::types::PhotoSize]) -> Option<&teloxide::types::PhotoSize> {
-    photos.iter().max_by_key(|photo| {
-        photo.file.size.max((photo.width * photo.height) as u32) as u64
-    })
+    photos
+        .iter()
+        .max_by_key(|photo| photo.file.size.max((photo.width * photo.height) as u32) as u64)
 }
 
 async fn download_telegram_file(bot: &Bot, file_id: &str, dest_path: &Path) -> Result<()> {
@@ -5539,9 +5618,7 @@ mod tests {
 
     #[test]
     fn peek_indices_filters_and_pages() {
-        let entries: Vec<EntryBlock> = (0..6)
-            .map(|i| entry(&format!("item {}", i)))
-            .collect();
+        let entries: Vec<EntryBlock> = (0..6).map(|i| entry(&format!("item {}", i))).collect();
         let mut peeked = HashSet::new();
         peeked.insert(entries[1].block_string());
         peeked.insert(entries[3].block_string());
@@ -5551,10 +5628,7 @@ mod tests {
             peek_indices(&entries, &peeked, ListMode::Top, 0),
             vec![0, 2, 4]
         );
-        assert_eq!(
-            peek_indices(&entries, &peeked, ListMode::Top, 1),
-            vec![5]
-        );
+        assert_eq!(peek_indices(&entries, &peeked, ListMode::Top, 1), vec![5]);
         assert_eq!(
             peek_indices(&entries, &peeked, ListMode::Bottom, 0),
             vec![5, 4, 2]
@@ -5567,9 +5641,7 @@ mod tests {
 
     #[test]
     fn search_peek_indices_ignore_peeked_entries() {
-        let entries: Vec<EntryBlock> = (0..4)
-            .map(|i| entry(&format!("match {}", i)))
-            .collect();
+        let entries: Vec<EntryBlock> = (0..4).map(|i| entry(&format!("match {}", i))).collect();
         let session = ListSession {
             id: "session".to_string(),
             chat_id: 0,
@@ -5710,7 +5782,10 @@ mod tests {
         };
 
         let lines = embedded_lines_for_view(&session, &HashSet::new());
-        assert_eq!(lines, vec!["first line".to_string(), "second line...".to_string()]);
+        assert_eq!(
+            lines,
+            vec!["first line".to_string(), "second line...".to_string()]
+        );
     }
 
     #[test]
@@ -5775,10 +5850,7 @@ mod tests {
         };
         assert_eq!(norm_target_index(&session, &peeked), Some(1));
 
-        let session_multi = ListSession {
-            entries,
-            ..session
-        };
+        let session_multi = ListSession { entries, ..session };
         let empty_peeked = HashSet::new();
         assert_eq!(norm_target_index(&session_multi, &empty_peeked), None);
     }
@@ -5816,10 +5888,7 @@ mod tests {
     #[test]
     fn parse_pull_mode_accepts_theirs() {
         assert!(matches!(parse_pull_mode(""), Ok(PullMode::FastForward)));
-        assert!(matches!(
-            parse_pull_mode("theirs"),
-            Ok(PullMode::Theirs)
-        ));
+        assert!(matches!(parse_pull_mode("theirs"), Ok(PullMode::Theirs)));
         assert!(parse_pull_mode("unknown").is_err());
     }
 
