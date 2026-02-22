@@ -329,6 +329,13 @@ enum ListMode {
     Bottom,
 }
 
+#[derive(Clone, Debug, Copy)]
+enum QuickSelectMode {
+    Top,
+    Last,
+    Random,
+}
+
 struct AppState {
     config: Config,
     write_lock: Mutex<()>,
@@ -550,7 +557,7 @@ async fn handle_message(bot: Bot, msg: Message, state: std::sync::Arc<AppState>)
             .trim();
         match cmd {
             "start" | "help" => {
-                let help = "Send any text to save it. Commands: /add <text>, /list, /search <query>, /download [url], /undos, /reset_peeked, /pull, /pull theirs, /push, /sync, /sync_x. Use --- to split a message into multiple items. In list views, use buttons for Mark Finished, Add Resource, Delete, Random. Quick actions: reply with del/delete to remove the current item, or send norm to normalize links.";
+                let help = "Send any text to save it. Commands: /add <text>, /list, /top, /last, /random, /search <query>, /download [url], /undos, /reset_peeked, /pull, /pull theirs, /push, /sync, /sync_x. Use --- to split a message into multiple items. In list views, use buttons for Mark Finished, Add Resource, Delete, Random. Quick actions: reply with del/delete to remove the current item, or send norm to normalize links.";
                 bot.send_message(msg.chat.id, help).await?;
                 return Ok(());
             }
@@ -569,10 +576,44 @@ async fn handle_message(bot: Bot, msg: Message, state: std::sync::Arc<AppState>)
             }
             "search" | "delete" => {
                 if rest.is_empty() {
-                    send_error(&bot, msg.chat.id, "Provide a search query.").await?;
+                    send_ephemeral(&bot, msg.chat.id, "Provide a search query.", ACK_TTL_SECS)
+                        .await?;
                 } else {
                     handle_search_command(bot.clone(), msg.clone(), state, rest).await?;
                 }
+                let _ = bot.delete_message(msg.chat.id, msg.id).await;
+                return Ok(());
+            }
+            "top" => {
+                handle_quick_select_command(
+                    bot.clone(),
+                    msg.clone(),
+                    state,
+                    QuickSelectMode::Top,
+                )
+                .await?;
+                let _ = bot.delete_message(msg.chat.id, msg.id).await;
+                return Ok(());
+            }
+            "last" => {
+                handle_quick_select_command(
+                    bot.clone(),
+                    msg.clone(),
+                    state,
+                    QuickSelectMode::Last,
+                )
+                .await?;
+                let _ = bot.delete_message(msg.chat.id, msg.id).await;
+                return Ok(());
+            }
+            "random" => {
+                handle_quick_select_command(
+                    bot.clone(),
+                    msg.clone(),
+                    state,
+                    QuickSelectMode::Random,
+                )
+                .await?;
                 let _ = bot.delete_message(msg.chat.id, msg.id).await;
                 return Ok(());
             }
@@ -1010,6 +1051,63 @@ async fn handle_list_command(
     Ok(())
 }
 
+async fn handle_quick_select_command(
+    bot: Bot,
+    msg: Message,
+    state: std::sync::Arc<AppState>,
+    mode: QuickSelectMode,
+) -> Result<()> {
+    let entries = read_entries(&state.config.read_later_path)?.1;
+    let Some(index) = quick_select_index(entries.len(), mode) else {
+        send_ephemeral(&bot, msg.chat.id, "Read Later is empty.", ACK_TTL_SECS).await?;
+        return Ok(());
+    };
+
+    let session_id = short_id();
+    let mut session = ListSession {
+        id: session_id.clone(),
+        chat_id: msg.chat.id.0,
+        kind: SessionKind::List,
+        entries,
+        view: ListView::Selected {
+            return_to: Box::new(ListView::Menu),
+            index,
+        },
+        seen_random: HashSet::new(),
+        message_id: None,
+        sent_media_message_ids: Vec::new(),
+    };
+
+    if matches!(mode, QuickSelectMode::Random) {
+        session.seen_random.insert(index);
+    }
+    if let Some(entry) = session.entries.get(index) {
+        state.peeked.lock().await.insert(entry.block_string());
+    }
+
+    let peeked_snapshot = state.peeked.lock().await.clone();
+    let (text, kb) = render_list_view(&session_id, &session, &peeked_snapshot, &state.config);
+    let sent = bot.send_message(msg.chat.id, text).reply_markup(kb).await?;
+    session.message_id = Some(sent.id);
+    if let Err(err) =
+        refresh_embedded_media_for_view(&bot, msg.chat.id, &state, &mut session, &peeked_snapshot)
+            .await
+    {
+        error!("send embedded media failed: {:#}", err);
+    }
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    state
+        .active_sessions
+        .lock()
+        .await
+        .insert(msg.chat.id.0, session_id);
+    Ok(())
+}
+
 async fn handle_search_command(
     bot: Bot,
     msg: Message,
@@ -1301,7 +1399,11 @@ async fn handle_sync_x_cookie_response(
                     sync_outcome.added_count,
                     sync_outcome.duplicate_count
                 );
-                bot.send_message(chat_id, text).await?;
+                let kb = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                    "Delete message",
+                    "msgdel",
+                )]]);
+                bot.send_message(chat_id, text).reply_markup(kb).await?;
             }
         }
         Err(err) => {
@@ -5501,6 +5603,22 @@ fn parse_command(text: &str) -> Option<&str> {
     Some(cmd.split('@').next().unwrap_or(cmd))
 }
 
+fn quick_select_index(entries_len: usize, mode: QuickSelectMode) -> Option<usize> {
+    if entries_len == 0 {
+        return None;
+    }
+    match mode {
+        QuickSelectMode::Top => Some(0),
+        QuickSelectMode::Last => Some(entries_len - 1),
+        QuickSelectMode::Random => {
+            let mut indices: Vec<usize> = (0..entries_len).collect();
+            let mut rng = rand::thread_rng();
+            indices.shuffle(&mut rng);
+            indices.first().copied()
+        }
+    }
+}
+
 fn short_id() -> String {
     let id = Uuid::new_v4().to_string();
     id.split('-').next().unwrap_or(&id).to_string()
@@ -5861,6 +5979,15 @@ mod tests {
         assert!(is_instant_delete_message("DEL"));
         assert!(is_instant_delete_message("Delete"));
         assert!(!is_instant_delete_message("remove"));
+    }
+
+    #[test]
+    fn quick_select_index_supports_top_last_random() {
+        assert_eq!(quick_select_index(0, QuickSelectMode::Top), None);
+        assert_eq!(quick_select_index(4, QuickSelectMode::Top), Some(0));
+        assert_eq!(quick_select_index(4, QuickSelectMode::Last), Some(3));
+        let random = quick_select_index(4, QuickSelectMode::Random).unwrap();
+        assert!(random < 4);
     }
 
     #[test]
