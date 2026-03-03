@@ -297,6 +297,7 @@ struct UndoSession {
 #[derive(Clone, Debug)]
 enum SessionKind {
     List,
+    Quick { mode: QuickSelectMode },
     Search { query: String },
 }
 
@@ -344,7 +345,7 @@ enum ListMode {
 #[derive(Clone, Debug, Copy)]
 enum QuickSelectMode {
     Top,
-    Last,
+    Bottom,
     Random,
 }
 
@@ -354,6 +355,7 @@ struct AppState {
     sessions: Mutex<HashMap<String, ListSession>>,
     active_sessions: Mutex<HashMap<i64, String>>,
     peeked: Mutex<HashSet<String>>,
+    quick_seen: Mutex<HashSet<String>>,
     undo_sessions: Mutex<HashMap<String, UndoSession>>,
     pickers: Mutex<HashMap<String, PickerState>>,
     add_prompts: Mutex<HashMap<String, AddPrompt>>,
@@ -402,6 +404,7 @@ async fn main() -> Result<()> {
         sessions: Mutex::new(HashMap::new()),
         active_sessions: Mutex::new(HashMap::new()),
         peeked: Mutex::new(HashSet::new()),
+        quick_seen: Mutex::new(HashSet::new()),
         undo_sessions: Mutex::new(HashMap::new()),
         pickers: Mutex::new(HashMap::new()),
         add_prompts: Mutex::new(HashMap::new()),
@@ -591,4 +594,3 @@ async fn queue_op(state: &std::sync::Arc<AppState>, op: QueuedOp) -> Result<()> 
     queue.push(op);
     save_queue(&state.queue_path, &queue)
 }
-

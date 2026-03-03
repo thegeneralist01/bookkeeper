@@ -131,7 +131,7 @@ pub(super) async fn handle_message(bot: Bot, msg: Message, state: std::sync::Arc
             .trim();
         match cmd {
             "start" | "help" => {
-                let help = "Send any text to save it. Commands: /start, /help, /add <text>, /list, /top, /last, /random, /search <query>, /delete <query>, /download [url], /undos, /reset_peeked, /pull, /pull theirs, /push, /sync, /sync_x. Use --- to split a message into multiple items. In list views, use buttons for Mark Finished, Add Resource, Delete, Random. Quick actions: reply with del/delete to remove the current item, or send norm to normalize links.";
+                let help = "Send any text to save it. Commands: /start, /help, /add <text>, /list, /top, /bottom (or /last), /random, /search <query>, /delete <query>, /download [url], /undos, /reset, /pull, /pull theirs, /push, /sync, /sync_x. Use --- to split a message into multiple items. In list views, use buttons for Mark Finished, Add Resource, Delete, Random. Quick actions: reply with del/delete to remove the current item, or send norm to normalize links.";
                 send_message_with_delete_button(&bot, msg.chat.id, help).await?;
                 return Ok(());
             }
@@ -169,12 +169,23 @@ pub(super) async fn handle_message(bot: Bot, msg: Message, state: std::sync::Arc
                 let _ = bot.delete_message(msg.chat.id, msg.id).await;
                 return Ok(());
             }
+            "bottom" => {
+                handle_quick_select_command(
+                    bot.clone(),
+                    msg.clone(),
+                    state,
+                    QuickSelectMode::Bottom,
+                )
+                .await?;
+                let _ = bot.delete_message(msg.chat.id, msg.id).await;
+                return Ok(());
+            }
             "last" => {
                 handle_quick_select_command(
                     bot.clone(),
                     msg.clone(),
                     state,
-                    QuickSelectMode::Last,
+                    QuickSelectMode::Bottom,
                 )
                 .await?;
                 let _ = bot.delete_message(msg.chat.id, msg.id).await;
@@ -196,8 +207,8 @@ pub(super) async fn handle_message(bot: Bot, msg: Message, state: std::sync::Arc
                 let _ = bot.delete_message(msg.chat.id, msg.id).await;
                 return Ok(());
             }
-            "reset_peeked" => {
-                reset_peeked(&state).await;
+            "reset" | "reset_peeked" => {
+                handle_reset_command(&bot, msg.chat.id).await?;
                 let _ = bot.delete_message(msg.chat.id, msg.id).await;
                 return Ok(());
             }
@@ -599,8 +610,14 @@ async fn handle_quick_select_command(
     mode: QuickSelectMode,
 ) -> Result<()> {
     let entries = read_entries(&state.config.read_later_path)?.1;
-    let Some(index) = quick_select_index(entries.len(), mode) else {
-        send_ephemeral(&bot, msg.chat.id, "Read Later is empty.", ACK_TTL_SECS).await?;
+    let quick_seen_snapshot = state.quick_seen.lock().await.clone();
+    let Some(index) = quick_select_index(&entries, &quick_seen_snapshot, mode) else {
+        let empty_text = if entries.is_empty() {
+            "Read Later is empty."
+        } else {
+            "Everything in quick view is already seen. Use /reset."
+        };
+        send_ephemeral(&bot, msg.chat.id, empty_text, ACK_TTL_SECS).await?;
         return Ok(());
     };
 
@@ -608,7 +625,7 @@ async fn handle_quick_select_command(
     let mut session = ListSession {
         id: session_id.clone(),
         chat_id: msg.chat.id.0,
-        kind: SessionKind::List,
+        kind: SessionKind::Quick { mode },
         entries,
         view: ListView::Selected {
             return_to: Box::new(ListView::Menu),
@@ -619,11 +636,8 @@ async fn handle_quick_select_command(
         sent_media_message_ids: Vec::new(),
     };
 
-    if matches!(mode, QuickSelectMode::Random) {
-        session.seen_random.insert(index);
-    }
     if let Some(entry) = session.entries.get(index) {
-        state.peeked.lock().await.insert(entry.block_string());
+        state.quick_seen.lock().await.insert(entry.block_string());
     }
 
     let peeked_snapshot = state.peeked.lock().await.clone();
@@ -646,6 +660,13 @@ async fn handle_quick_select_command(
         .lock()
         .await
         .insert(msg.chat.id.0, session_id);
+    Ok(())
+}
+
+async fn handle_reset_command(bot: &Bot, chat_id: ChatId) -> Result<()> {
+    let text = "Reset seen state for which scope?";
+    let kb = build_reset_scope_keyboard();
+    bot.send_message(chat_id, text).reply_markup(kb).await?;
     Ok(())
 }
 

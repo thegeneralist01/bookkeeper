@@ -28,6 +28,8 @@ pub(super) async fn handle_callback(
             handle_undos_callback(bot, q, state).await?;
         } else if data.starts_with("undo:") {
             handle_undo_callback(bot, q, state).await?;
+        } else if data.starts_with("reset:") {
+            handle_reset_callback(bot, q, state).await?;
         }
     }
 
@@ -464,6 +466,41 @@ async fn handle_message_delete_callback(bot: Bot, q: CallbackQuery) -> Result<()
     Ok(())
 }
 
+async fn handle_reset_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    state: std::sync::Arc<AppState>,
+) -> Result<()> {
+    let Some(data) = q.data.as_deref() else {
+        return Ok(());
+    };
+    let scope = data.trim_start_matches("reset:");
+    let chat_id = chat_id_from_user_id(q.from.id.0);
+
+    match scope {
+        "all" => {
+            reset_all_seen(&state).await;
+            send_ephemeral(&bot, chat_id, "Reset list and quick seen state.", ACK_TTL_SECS).await?;
+        }
+        "list" => {
+            reset_peeked(&state).await;
+            send_ephemeral(&bot, chat_id, "Reset list seen state.", ACK_TTL_SECS).await?;
+        }
+        "quick" => {
+            reset_quick_seen(&state).await;
+            send_ephemeral(&bot, chat_id, "Reset quick seen state.", ACK_TTL_SECS).await?;
+        }
+        "cancel" => {}
+        _ => {}
+    }
+
+    if let Some(message) = q.message.clone() {
+        let _ = bot.delete_message(message.chat.id, message.id).await;
+    }
+    bot.answer_callback_query(q.id).await?;
+    Ok(())
+}
+
 async fn handle_list_callback(
     bot: Bot,
     q: CallbackQuery,
@@ -535,6 +572,27 @@ async fn handle_list_callback(
                         mode,
                         page: page + 1,
                     };
+                } else if let (SessionKind::Quick { mode }, ListView::Selected { .. }) =
+                    (session.kind.clone(), session.view.clone())
+                {
+                    let quick_seen_snapshot = state.quick_seen.lock().await.clone();
+                    if let Some(index) = quick_select_index(&session.entries, &quick_seen_snapshot, mode) {
+                        session.view = ListView::Selected {
+                            return_to: Box::new(ListView::Menu),
+                            index,
+                        };
+                        if let Some(entry) = session.entries.get(index) {
+                            state.quick_seen.lock().await.insert(entry.block_string());
+                        }
+                    } else {
+                        send_ephemeral(
+                            &bot,
+                            message.chat.id,
+                            "No more unseen quick items. Use /reset.",
+                            ACK_TTL_SECS,
+                        )
+                        .await?;
+                    }
                 }
             }
             "prev" => {
@@ -553,7 +611,7 @@ async fn handle_list_callback(
                 };
             }
             "close" => {
-                if matches!(&session.kind, SessionKind::Search { .. }) {
+                if matches!(&session.kind, SessionKind::Search { .. } | SessionKind::Quick { .. }) {
                     delete_embedded_media_messages(
                         &bot,
                         message.chat.id,
@@ -609,6 +667,27 @@ async fn handle_list_callback(
                                 }
                             }
                         }
+                    }
+                } else if matches!(&session.kind, SessionKind::Quick { .. }) {
+                    let quick_seen_snapshot = state.quick_seen.lock().await.clone();
+                    if let Some(index) =
+                        quick_select_index(&session.entries, &quick_seen_snapshot, QuickSelectMode::Random)
+                    {
+                        session.view = ListView::Selected {
+                            return_to: Box::new(ListView::Menu),
+                            index,
+                        };
+                        if let Some(entry) = session.entries.get(index) {
+                            state.quick_seen.lock().await.insert(entry.block_string());
+                        }
+                    } else {
+                        send_ephemeral(
+                            &bot,
+                            message.chat.id,
+                            "No unseen quick items. Use /reset.",
+                            ACK_TTL_SECS,
+                        )
+                        .await?;
                     }
                 }
             }

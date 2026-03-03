@@ -301,12 +301,32 @@ fn command_keywords_are_case_insensitive() {
 }
 
 #[test]
-fn quick_select_index_supports_top_last_random() {
-    assert_eq!(quick_select_index(0, QuickSelectMode::Top), None);
-    assert_eq!(quick_select_index(4, QuickSelectMode::Top), Some(0));
-    assert_eq!(quick_select_index(4, QuickSelectMode::Last), Some(3));
-    let random = quick_select_index(4, QuickSelectMode::Random).unwrap();
+fn quick_select_index_supports_top_bottom_random() {
+    let entries: Vec<EntryBlock> = (0..4).map(|i| entry(&format!("item {}", i))).collect();
+    let seen = HashSet::new();
+    assert_eq!(quick_select_index(&[], &seen, QuickSelectMode::Top), None);
+    assert_eq!(
+        quick_select_index(&entries, &seen, QuickSelectMode::Top),
+        Some(0)
+    );
+    assert_eq!(
+        quick_select_index(&entries, &seen, QuickSelectMode::Bottom),
+        Some(3)
+    );
+    let random = quick_select_index(&entries, &seen, QuickSelectMode::Random).unwrap();
     assert!(random < 4);
+
+    let mut seen_some = HashSet::new();
+    seen_some.insert(entries[0].block_string());
+    seen_some.insert(entries[3].block_string());
+    assert_eq!(
+        quick_select_index(&entries, &seen_some, QuickSelectMode::Top),
+        Some(1)
+    );
+    assert_eq!(
+        quick_select_index(&entries, &seen_some, QuickSelectMode::Bottom),
+        Some(2)
+    );
 }
 
 #[test]

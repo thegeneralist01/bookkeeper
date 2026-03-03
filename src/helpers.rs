@@ -367,6 +367,17 @@ pub(super) fn build_download_quality_keyboard(
     InlineKeyboardMarkup::new(rows)
 }
 
+pub(super) fn build_reset_scope_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("All", "reset:all"),
+            InlineKeyboardButton::callback("List", "reset:list"),
+            InlineKeyboardButton::callback("Quick", "reset:quick"),
+        ],
+        vec![InlineKeyboardButton::callback("Cancel", "reset:cancel")],
+    ])
+}
+
 pub(super) fn render_list_view(
     session_id: &str,
     session: &ListSession,
@@ -420,6 +431,25 @@ pub(super) fn build_menu_view(session_id: &str, session: &ListSession) -> (Strin
 
             (text, InlineKeyboardMarkup::new(rows))
         }
+        SessionKind::Quick { mode } => {
+            let mode_label = match mode {
+                QuickSelectMode::Top => "top",
+                QuickSelectMode::Bottom => "bottom",
+                QuickSelectMode::Random => "random",
+            };
+            let text = format!("Quick view ({})", mode_label);
+            let rows = vec![
+                vec![InlineKeyboardButton::callback(
+                    "Next",
+                    format!("ls:{}:next", session_id),
+                )],
+                vec![InlineKeyboardButton::callback(
+                    "Close",
+                    format!("ls:{}:close", session_id),
+                )],
+            ];
+            (text, InlineKeyboardMarkup::new(rows))
+        }
         SessionKind::Search { query } => {
             let text = if count == 0 {
                 format!("No matches for \"{}\".", query)
@@ -467,6 +497,14 @@ pub(super) fn build_peek_view(
             };
             let page_display = if total_pages == 0 { 0 } else { page + 1 };
             format!("{} (page {})\n", title, page_display)
+        }
+        SessionKind::Quick { mode } => {
+            let label = match mode {
+                QuickSelectMode::Top => "top",
+                QuickSelectMode::Bottom => "bottom",
+                QuickSelectMode::Random => "random",
+            };
+            format!("Quick view ({})\n", label)
         }
         SessionKind::Search { query } => {
             if total_pages > 0 {
@@ -526,6 +564,16 @@ pub(super) fn build_peek_view(
                 InlineKeyboardButton::callback("Random", format!("ls:{}:random", session_id)),
             ]);
         }
+        SessionKind::Quick { .. } => {
+            rows.push(vec![InlineKeyboardButton::callback(
+                "Next",
+                format!("ls:{}:next", session_id),
+            )]);
+            rows.push(vec![InlineKeyboardButton::callback(
+                "Close",
+                format!("ls:{}:close", session_id),
+            )]);
+        }
         SessionKind::Search { .. } => {
             rows.push(vec![InlineKeyboardButton::callback(
                 "Close",
@@ -570,6 +618,26 @@ pub(super) fn build_selected_view(
             vec![InlineKeyboardButton::callback(
                 "Back",
                 format!("ls:{}:back", session_id),
+            )],
+        ],
+        SessionKind::Quick { .. } => vec![
+            vec![
+                InlineKeyboardButton::callback(
+                    "Mark Finished",
+                    format!("ls:{}:finish", session_id),
+                ),
+                InlineKeyboardButton::callback(
+                    "Add Resource",
+                    format!("ls:{}:resource", session_id),
+                ),
+            ],
+            vec![
+                InlineKeyboardButton::callback("Delete", format!("ls:{}:delete", session_id)),
+                InlineKeyboardButton::callback("Random", format!("ls:{}:random", session_id)),
+            ],
+            vec![InlineKeyboardButton::callback(
+                "Next",
+                format!("ls:{}:next", session_id),
             )],
         ],
         SessionKind::Search { .. } => vec![
@@ -719,6 +787,7 @@ pub(super) fn count_visible_entries(session: &ListSession, peeked: &HashSet<Stri
     match session.kind {
         SessionKind::Search { .. } => session.entries.len(),
         SessionKind::List => count_unpeeked_entries(&session.entries, peeked),
+        SessionKind::Quick { .. } => session.entries.len(),
     }
 }
 
@@ -787,6 +856,7 @@ pub(super) fn peek_indices_for_session(
     match session.kind {
         SessionKind::Search { .. } => peek_indices_all(&session.entries, mode, page),
         SessionKind::List => peek_indices(&session.entries, peeked, mode, page),
+        SessionKind::Quick { .. } => peek_indices_all(&session.entries, mode, page),
     }
 }
 
@@ -906,6 +976,16 @@ pub(super) async fn refresh_embedded_media_for_view(
 pub(super) async fn reset_peeked(state: &std::sync::Arc<AppState>) {
     let mut peeked = state.peeked.lock().await;
     peeked.clear();
+}
+
+pub(super) async fn reset_quick_seen(state: &std::sync::Arc<AppState>) {
+    let mut quick_seen = state.quick_seen.lock().await;
+    quick_seen.clear();
+}
+
+pub(super) async fn reset_all_seen(state: &std::sync::Arc<AppState>) {
+    reset_peeked(state).await;
+    reset_quick_seen(state).await;
 }
 
 pub(super) async fn add_undo(
@@ -1518,18 +1598,27 @@ pub(super) fn parse_command(text: &str) -> Option<&str> {
     Some(cmd.split('@').next().unwrap_or(cmd))
 }
 
-pub(super) fn quick_select_index(entries_len: usize, mode: QuickSelectMode) -> Option<usize> {
-    if entries_len == 0 {
+pub(super) fn quick_select_index(
+    entries: &[EntryBlock],
+    quick_seen: &HashSet<String>,
+    mode: QuickSelectMode,
+) -> Option<usize> {
+    let mut unseen_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| !quick_seen.contains(&entry.block_string()))
+        .map(|(idx, _)| idx)
+        .collect();
+    if unseen_indices.is_empty() {
         return None;
     }
     match mode {
-        QuickSelectMode::Top => Some(0),
-        QuickSelectMode::Last => Some(entries_len - 1),
+        QuickSelectMode::Top => unseen_indices.first().copied(),
+        QuickSelectMode::Bottom => unseen_indices.last().copied(),
         QuickSelectMode::Random => {
-            let mut indices: Vec<usize> = (0..entries_len).collect();
             let mut rng = rand::thread_rng();
-            indices.shuffle(&mut rng);
-            indices.first().copied()
+            unseen_indices.shuffle(&mut rng);
+            unseen_indices.first().copied()
         }
     }
 }
