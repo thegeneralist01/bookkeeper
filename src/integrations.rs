@@ -115,8 +115,6 @@ pub(super) fn run_pull(sync: &SyncConfig, mode: PullMode) -> Result<PullOutcome>
         ));
     }
 
-    let token = read_token_file(&sync.token_file)?;
-
     let remotes = git_remote_names(&sync.repo_path)?;
     let remote = if remotes.iter().any(|name| name == "origin") {
         "origin".to_string()
@@ -127,15 +125,12 @@ pub(super) fn run_pull(sync: &SyncConfig, mode: PullMode) -> Result<PullOutcome>
             .ok_or_else(|| anyhow!("Git remote not configured."))?
     };
     let remote_url = git_remote_url(&sync.repo_path, &remote)?;
-    if !remote_url.starts_with("https://") {
+    if !is_ssh_remote_url(&remote_url) {
         return Err(anyhow!(
-            "Sync requires HTTPS remote for PAT auth. Remote is {}",
+            "Pull requires SSH remote with machine key auth. Remote is {}",
             remote_url
         ));
     }
-
-    let username =
-        extract_https_username(&remote_url).unwrap_or_else(|| "x-access-token".to_string());
 
     let status_output = run_git(&sync.repo_path, &["status", "--porcelain"], Vec::new())?;
     if !status_output.status.success() {
@@ -152,15 +147,6 @@ pub(super) fn run_pull(sync: &SyncConfig, mode: PullMode) -> Result<PullOutcome>
         return Err(anyhow!("Sync failed: detached HEAD."));
     }
 
-    let askpass = create_askpass_script()?;
-    let askpass_path = askpass.to_string_lossy().to_string();
-    let pull_env = vec![
-        ("GIT_TERMINAL_PROMPT", "0".to_string()),
-        ("GIT_ASKPASS", askpass_path),
-        ("GIT_SYNC_USERNAME", username),
-        ("GIT_SYNC_PAT", token),
-    ];
-
     let pull_args: Vec<String> = match mode {
         PullMode::FastForward => vec!["pull".to_string(), "--ff-only".to_string(), remote, branch],
         PullMode::Theirs => vec![
@@ -173,7 +159,7 @@ pub(super) fn run_pull(sync: &SyncConfig, mode: PullMode) -> Result<PullOutcome>
         ],
     };
     let pull_args_ref: Vec<&str> = pull_args.iter().map(|arg| arg.as_str()).collect();
-    let pull_output = run_git(&sync.repo_path, &pull_args_ref, pull_env)?;
+    let pull_output = run_git(&sync.repo_path, &pull_args_ref, Vec::new())?;
     if !pull_output.status.success() {
         return Err(anyhow!(format_git_error("git pull", &pull_output)));
     }
@@ -492,7 +478,10 @@ pub(super) fn read_sync_x_urls(path: &Path) -> Result<Vec<String>> {
     Ok(urls)
 }
 
-pub(super) fn prepend_urls_to_read_later_sync(path: &Path, urls: &[String]) -> Result<(usize, usize)> {
+pub(super) fn prepend_urls_to_read_later_sync(
+    path: &Path,
+    urls: &[String],
+) -> Result<(usize, usize)> {
     let (preamble, mut entries) = read_entries(path)?;
     let mut existing = HashSet::new();
     for entry in &entries {
@@ -527,7 +516,11 @@ pub(super) struct GitOutput {
     pub(super) stderr: String,
 }
 
-pub(super) fn run_git(repo_path: &Path, args: &[&str], envs: Vec<(&str, String)>) -> Result<GitOutput> {
+pub(super) fn run_git(
+    repo_path: &Path,
+    args: &[&str],
+    envs: Vec<(&str, String)>,
+) -> Result<GitOutput> {
     let mut cmd = Command::new("git");
     cmd.current_dir(repo_path).args(args);
     for (key, value) in envs {
@@ -638,6 +631,11 @@ pub(super) fn extract_https_username(remote_url: &str) -> Option<String> {
     } else {
         Some(username.to_string())
     }
+}
+
+pub(super) fn is_ssh_remote_url(remote_url: &str) -> bool {
+    remote_url.starts_with("ssh://")
+        || (!remote_url.contains("://") && remote_url.contains('@') && remote_url.contains(':'))
 }
 
 pub(super) fn is_nothing_to_commit(output: &GitOutput) -> bool {
@@ -874,7 +872,11 @@ pub(super) fn human_size(bytes: u64) -> String {
     }
 }
 
-pub(super) fn run_ytdlp_download(target_dir: &Path, link: &str, format_selector: &str) -> Result<PathBuf> {
+pub(super) fn run_ytdlp_download(
+    target_dir: &Path,
+    link: &str,
+    format_selector: &str,
+) -> Result<PathBuf> {
     let template = target_dir.join("%(title).200B-%(id)s.%(ext)s");
     let output = Command::new("yt-dlp")
         .arg("--no-playlist")

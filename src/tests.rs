@@ -344,6 +344,14 @@ fn extract_https_username_from_remote() {
 }
 
 #[test]
+fn is_ssh_remote_url_detects_supported_formats() {
+    assert!(is_ssh_remote_url("git@github.com:owner/repo.git"));
+    assert!(is_ssh_remote_url("ssh://git@github.com/owner/repo.git"));
+    assert!(!is_ssh_remote_url("https://github.com/owner/repo.git"));
+    assert!(!is_ssh_remote_url("https://user@github.com/owner/repo.git"));
+}
+
+#[test]
 fn read_token_file_trims_whitespace() {
     let mut file = NamedTempFile::new().unwrap();
     file.write_all(b"  token\n").unwrap();
